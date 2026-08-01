@@ -86,6 +86,9 @@ pub struct ViewState {
     pub show_fractions: Option<bool>,
     #[serde(default)]
     pub plate_uniform_ramp: Option<bool>,
+    /// Navigation rail reduced to icons only.
+    #[serde(default)]
+    pub nav_collapsed: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -54,6 +54,28 @@ impl Section {
             Section::Reports => "Reports",
         }
     }
+
+    /// A single glyph standing in for the section when the rail is collapsed.
+    ///
+    /// Deliberately drawn from a narrow set of characters: Inter and JetBrains
+    /// Mono are not vendored (`assets/fonts/README.md`), so on most machines
+    /// these render through egui's bundled fallback faces, where anything
+    /// exotic comes out as tofu. `nav_icons_render_in_the_bundled_fonts` in
+    /// `app.rs` checks the actual glyph coverage rather than trusting the
+    /// choice. An icon never travels alone — the collapsed rail pairs it with a
+    /// hover tooltip carrying [`Section::label`], because a control identified
+    /// only by its appearance is the failure rule #3 exists to prevent.
+    pub fn icon(self) -> &'static str {
+        match self {
+            Section::Overview => "☰",
+            Section::Chromatograms => "🗠",
+            Section::Peaks => "Λ",
+            Section::Integration => "∫",
+            Section::Calibration => "⚖",
+            Section::Results => "∑",
+            Section::Reports => "🖹",
+        }
+    }
 }
 
 /// Which baseline the next integration will use.
@@ -136,6 +158,8 @@ impl ConcentrationInputs {
 #[derive(Clone, Debug)]
 pub struct View {
     pub section: Section,
+    /// Navigation rail reduced to icons only.
+    pub nav_collapsed: bool,
 
     // --- channel display ---
     pub hidden_channels: BTreeSet<ChannelId>,
@@ -183,6 +207,7 @@ impl Default for View {
     fn default() -> Self {
         Self {
             section: Section::Overview,
+            nav_collapsed: false,
             hidden_channels: BTreeSet::new(),
             selected_channel: None,
             hero_channel_id: None,
@@ -286,6 +311,18 @@ impl View {
         }
     }
 
+    /// Collapse or expand the navigation rail.
+    ///
+    /// Marked dirty like the other saved display preferences: the rail state
+    /// rides in the sidecar because `persist_egui_memory` is off, so an unsaved
+    /// toggle really would be lost on the next launch.
+    pub fn set_nav_collapsed(&mut self, collapsed: bool) {
+        if self.nav_collapsed != collapsed {
+            self.nav_collapsed = collapsed;
+            self.dirty = true;
+        }
+    }
+
     pub fn set_plate_channel(&mut self, channel: Option<ChannelId>) {
         if self.plate_channel != channel {
             self.plate_channel = channel;
@@ -385,6 +422,7 @@ impl View {
             plate_metric: Some(self.plate_metric),
             show_fractions: Some(self.show_fractions),
             plate_uniform_ramp: Some(self.plate_uniform_ramp),
+            nav_collapsed: Some(self.nav_collapsed),
         };
         sidecar
     }
@@ -455,6 +493,9 @@ impl View {
         }
         if let Some(enabled) = sidecar.view.plate_uniform_ramp {
             self.plate_uniform_ramp = enabled;
+        }
+        if let Some(collapsed) = sidecar.view.nav_collapsed {
+            self.nav_collapsed = collapsed;
         }
 
         self.dirty = false;
@@ -545,6 +586,7 @@ mod tests {
         view.set_plate_metric(PlateMetric::MaxValue);
         view.set_show_fractions(false);
         view.set_plate_uniform_ramp(true);
+        view.set_nav_collapsed(true);
         let peak_id = view.allocate_peak_id();
         view.add_peak(PeakResult {
             id: peak_id,
@@ -568,7 +610,21 @@ mod tests {
         assert_eq!(restored.plate_metric, PlateMetric::MaxValue);
         assert!(!restored.show_fractions);
         assert!(restored.plate_uniform_ramp);
+        assert!(restored.nav_collapsed);
         assert!(!restored.dirty, "a freshly loaded sidecar is not dirty");
+    }
+
+    #[test]
+    fn a_sidecar_written_before_the_rail_existed_leaves_it_alone() {
+        // `nav_collapsed` is optional precisely so an older file does not force
+        // the rail open on someone who collapsed it.
+        let run = test_run();
+        let mut view = View::default();
+        view.set_nav_collapsed(true);
+        let mut sidecar = Sidecar::for_run(&run);
+        sidecar.view.nav_collapsed = None;
+        view.apply_sidecar(&sidecar, &run);
+        assert!(view.nav_collapsed);
     }
 
     #[test]
