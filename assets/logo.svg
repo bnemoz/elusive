@@ -1,0 +1,26 @@
+<svg width="240" height="120" viewBox="0 0 240 120" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="EluSive logo">
+  <title>EluSive</title>
+  <defs>
+    <!-- Brand gradient: MIST (top) fading to BLUE (bottom), per the sheet. -->
+    <linearGradient id="elusivePeak" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%"  stop-color="#E6F2EE"/>
+      <stop offset="45%" stop-color="#BFD6E6"/>
+      <stop offset="100%" stop-color="#4C7DBA"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Three-peak chromatogram, center peak tallest, on a flat baseline. -->
+  <path d="M 8,100 L 32,100
+           C 46,100 50,58 64,56
+           C 76,54 80,88 94,90
+           C 106,92 110,22 122,20
+           C 134,18 140,86 154,88
+           C 168,90 174,60 188,62
+           C 200,64 204,100 218,100
+           L 232,100"
+        fill="none"
+        stroke="url(#elusivePeak)"
+        stroke-width="7"
+        stroke-linecap="round"
+        stroke-linejoin="round"/>
+</svg>

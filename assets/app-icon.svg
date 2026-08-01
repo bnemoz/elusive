@@ -1,0 +1,36 @@
+<svg width="256" height="256" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="EluSive app icon">
+  <title>EluSive</title>
+  <defs>
+    <linearGradient id="iconPeak" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%"  stop-color="#E6F2EE"/>
+      <stop offset="45%" stop-color="#BFD6E6"/>
+      <stop offset="100%" stop-color="#4C7DBA"/>
+    </linearGradient>
+  </defs>
+
+  <!-- INK rounded tile -->
+  <rect x="0" y="0" width="256" height="256" rx="56" fill="#0D1B2A"/>
+
+  <!-- Peak mark, centered -->
+  <g transform="translate(28,70) scale(0.83)">
+    <path d="M 8,100 L 32,100
+             C 46,100 50,58 64,56
+             C 76,54 80,88 94,90
+             C 106,92 110,22 122,20
+             C 134,18 140,86 154,88
+             C 168,90 174,60 188,62
+             C 200,64 204,100 218,100
+             L 232,100"
+          fill="none"
+          stroke="url(#iconPeak)"
+          stroke-width="8"
+          stroke-linecap="round"
+          stroke-linejoin="round"/>
+  </g>
+
+  <!-- Wordmark -->
+  <text x="128" y="212" text-anchor="middle"
+        font-family="Inter, system-ui, sans-serif" font-size="34" font-weight="600">
+    <tspan fill="#E6F2EE">Elu</tspan><tspan fill="#4C7DBA">Sive</tspan>
+  </text>
+</svg>

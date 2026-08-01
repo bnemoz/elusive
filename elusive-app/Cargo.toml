@@ -1,0 +1,21 @@
+[package]
+name = "elusive-app"
+description = "EluSive desktop viewer for Bio-Rad NGC / ChromLab runs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "elusive"
+path = "src/main.rs"
+
+[dependencies]
+elusive-core.workspace = true
+eframe.workspace = true
+egui.workspace = true
+egui_plot.workspace = true
+rfd.workspace = true
+anyhow.workspace = true
+serde.workspace = true

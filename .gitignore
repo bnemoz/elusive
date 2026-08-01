@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Sidecars produced while testing against real runs.
+*.elusive.json
+
+# Real instrument exports are not redistributable; keep them out of the repo.
+/testdata/private/
