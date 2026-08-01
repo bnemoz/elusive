@@ -531,6 +531,65 @@ impl Run {
             .collect()
     }
 
+    /// Fractions that actually *received* part of the eluate between `v0` and `v1`.
+    ///
+    /// This is deliberately stricter than [`Self::fractions_in_volume`], which
+    /// uses closed intervals so that a cursor parked on a boundary still lights
+    /// up the neighbouring fraction. Collection tiles the elution without gaps —
+    /// fraction *n* ends exactly where *n+1* begins — so under a closed test a
+    /// peak integrated over `[10, 12]` would report the fractions on both sides
+    /// of it as well, even though none of that peak went into either tube. Here
+    /// the intersection must have positive width: touching a boundary does not
+    /// count.
+    ///
+    /// Fractions without a usable window are skipped, because a zero-width or
+    /// non-finite window cannot be said to have caught any part of the peak.
+    ///
+    /// The result is in **collection order** — ascending start volume, tube
+    /// number as the tie-break — which is the order a user reads off the
+    /// chromatogram from left to right. On a serpentine rack that is not the
+    /// same as alphabetical well order.
+    pub fn fractions_overlapping(&self, v0: f32, v1: f32) -> Vec<&Fraction> {
+        let (v0, v1) = if v0 <= v1 { (v0, v1) } else { (v1, v0) };
+        let mut hits: Vec<&Fraction> = self
+            .fractions
+            .iter()
+            .filter(|f| f.has_usable_window())
+            .filter(|f| {
+                let (a, b) = f.volume_window();
+                b > v0 && a < v1
+            })
+            .collect();
+        hits.sort_by(|x, y| {
+            x.volume_window()
+                .0
+                .total_cmp(&y.volume_window().0)
+                .then(x.tube.cmp(&y.tube))
+        });
+        hits
+    }
+
+    /// Plate positions of [`Self::fractions_overlapping`], in collection order.
+    ///
+    /// A fraction whose rack type or collection pattern could not be resolved has
+    /// no well and is dropped, so this list can be shorter than the fraction list
+    /// it came from — compare the two lengths before telling a user that nothing
+    /// was collected. Repeated wells are collapsed: the two `Trace_Fractions_*`
+    /// streams can describe the same tube twice.
+    pub fn wells_in_volume(&self, v0: f32, v1: f32) -> Vec<Well> {
+        let mut wells: Vec<Well> = Vec::new();
+        for well in self
+            .fractions_overlapping(v0, v1)
+            .into_iter()
+            .filter_map(|f| f.well)
+        {
+            if !wells.contains(&well) {
+                wells.push(well);
+            }
+        }
+        wells
+    }
+
     /// Default sidecar location: `<run>.elusive.json` beside the source file.
     pub fn sidecar_path(&self) -> std::path::PathBuf {
         crate::sidecar::sidecar_path_for(&self.source_path)
@@ -585,4 +644,136 @@ pub struct PeakResult {
     pub fwhm_ml: Option<f32>,
     /// Filled in by [`crate::calibration`] once a curve is applied.
     pub estimated_mw_kda: Option<f64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wells::{well_for_tube, CollectionPattern, RackGeometry};
+
+    /// One serpentine HEP96 fraction, `size` mL wide, starting at `start`.
+    fn fraction(tube: u32, start: f32, size: f32) -> Fraction {
+        Fraction {
+            tube,
+            rack: 1,
+            well: well_for_tube(tube, RackGeometry::HEP96, CollectionPattern::Serpentine),
+            vol_start_ml: start,
+            vol_end_ml: start + size,
+            time_start_s: 0.0,
+            time_end_s: 0.0,
+            nominal_size_ml: Some(size),
+            end_estimated: false,
+            rack_type: "HEP96".into(),
+            pattern: "Serpentine".into(),
+        }
+    }
+
+    fn run_with(fractions: Vec<Fraction>) -> Run {
+        Run {
+            meta: RunMeta::default(),
+            source_format: SourceFormat::NgcAnalysis,
+            source_path: std::path::PathBuf::from("run.ngcAnalysis"),
+            channels: Vec::new(),
+            fractions,
+            events: Vec::new(),
+            warnings: Vec::new(),
+        }
+    }
+
+    /// Tubes 1..=n tiling the elution from 10 mL in 1 mL steps: tube 1 is
+    /// `[10, 11)`, tube 2 `[11, 12)`, and so on.
+    fn tiled_run(n: u32) -> Run {
+        run_with((1..=n).map(|t| fraction(t, 9.0 + t as f32, 1.0)).collect())
+    }
+
+    fn labels(run: &Run, v0: f32, v1: f32) -> Vec<String> {
+        run.wells_in_volume(v0, v1)
+            .iter()
+            .map(Well::label)
+            .collect()
+    }
+
+    #[test]
+    fn a_peak_inside_one_fraction_reports_only_that_fraction() {
+        assert_eq!(labels(&tiled_run(6), 12.2, 12.8), ["A3"]);
+    }
+
+    #[test]
+    fn a_peak_spanning_four_fractions_reports_all_four_in_collection_order() {
+        assert_eq!(labels(&tiled_run(8), 12.5, 15.5), ["A3", "A4", "A5", "A6"]);
+    }
+
+    #[test]
+    fn a_peak_eluting_before_collection_started_reports_nothing() {
+        assert!(tiled_run(6).wells_in_volume(2.0, 5.0).is_empty());
+    }
+
+    #[test]
+    fn a_run_with_no_fractions_reports_nothing() {
+        assert!(run_with(Vec::new()).wells_in_volume(0.0, 100.0).is_empty());
+    }
+
+    #[test]
+    fn a_fraction_with_an_unusable_window_is_never_reported() {
+        // A zero-width window and a NaN window both fail `has_usable_window`, and
+        // neither can honestly be said to hold part of the peak.
+        let collapsed = fraction(1, 12.0, 0.0);
+        let mut nonfinite = fraction(2, 12.0, 1.0);
+        nonfinite.vol_end_ml = f32::NAN;
+
+        let run = run_with(vec![collapsed, nonfinite]);
+        assert!(run.fractions_overlapping(10.0, 14.0).is_empty());
+    }
+
+    #[test]
+    fn touching_a_fraction_boundary_does_not_count_as_overlap() {
+        // Fractions tile without gaps, so a peak integrated over exactly one
+        // fraction's window must not drag in its two neighbours.
+        assert_eq!(labels(&tiled_run(6), 12.0, 13.0), ["A3"]);
+        // And a zero-width window touches nothing at all.
+        assert!(tiled_run(6).wells_in_volume(12.0, 12.0).is_empty());
+    }
+
+    #[test]
+    fn the_permissive_hover_test_still_includes_boundary_neighbours() {
+        // `fractions_in_volume` keeps its closed-interval behaviour: the plate
+        // highlight wants the neighbours, the peak report does not.
+        let run = tiled_run(6);
+        assert_eq!(run.fractions_in_volume(12.0, 13.0).len(), 3);
+        assert_eq!(run.fractions_overlapping(12.0, 13.0).len(), 1);
+    }
+
+    #[test]
+    fn a_reversed_window_is_normalised_rather_than_returning_nothing() {
+        assert_eq!(labels(&tiled_run(8), 15.5, 12.5), ["A3", "A4", "A5", "A6"]);
+    }
+
+    #[test]
+    fn wells_come_back_in_collection_order_even_when_records_are_shuffled() {
+        // Serpentine row B runs B12 → B1, so collection order and alphabetical
+        // well order disagree; the records themselves arrive out of order here.
+        let run = run_with(vec![
+            fraction(14, 22.0, 1.0),
+            fraction(12, 20.0, 1.0),
+            fraction(13, 21.0, 1.0),
+        ]);
+        assert_eq!(labels(&run, 20.5, 22.5), ["A12", "B12", "B11"]);
+    }
+
+    #[test]
+    fn a_fraction_without_a_resolved_well_drops_out_of_the_well_list() {
+        let mut unplaced = fraction(3, 12.0, 1.0);
+        unplaced.well = None;
+        let run = run_with(vec![unplaced, fraction(4, 13.0, 1.0)]);
+        // The fraction is still counted; only its plate position is missing.
+        assert_eq!(run.fractions_overlapping(12.0, 14.0).len(), 2);
+        assert_eq!(labels(&run, 12.0, 14.0), ["A4"]);
+    }
+
+    #[test]
+    fn a_well_described_twice_is_listed_once() {
+        // The two `Trace_Fractions_*` streams can both describe the same tube.
+        let run = run_with(vec![fraction(3, 12.0, 1.0), fraction(3, 12.0, 1.0)]);
+        assert_eq!(labels(&run, 12.0, 13.0), ["A3"]);
+    }
 }

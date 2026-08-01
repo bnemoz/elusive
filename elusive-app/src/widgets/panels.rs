@@ -798,7 +798,7 @@ pub fn results_table(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) {
     let cal = view.calibration.clone();
 
     egui::Grid::new("results")
-        .num_columns(6)
+        .num_columns(7)
         .spacing([spacing::LG, spacing::XS])
         .show(ui, |ui| {
             for header in [
@@ -808,6 +808,7 @@ pub fn results_table(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) {
                 "Area",
                 "Est. MW (kDa)",
                 "Conc. (mg/mL)",
+                "Fractions",
             ] {
                 ui.label(
                     egui::RichText::new(header)
@@ -853,9 +854,94 @@ pub fn results_table(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) {
                     "—".to_string()
                 };
                 ui.label(egui::RichText::new(conc).font(font_code()));
+
+                let cell = fractions_cell(run, peak);
+                ui.label(egui::RichText::new(&cell.text).font(font_code()).color(c(
+                    if cell.wells_known {
+                        t.text_primary
+                    } else {
+                        t.text_secondary
+                    },
+                )))
+                .on_hover_text(&cell.hover);
                 ui.end_row();
             }
         });
+}
+
+/// The Fractions cell for one peak: what to print, and what to explain on hover.
+struct FractionsCell {
+    text: String,
+    hover: String,
+    /// False when the cell is a dash, so the dash can be dimmed like the other
+    /// "we do not know" values in this table rather than reading as data.
+    wells_known: bool,
+}
+
+/// How many entries fit before the column starts to distort the table. A peak
+/// over a long shallow shoulder can touch dozens of tubes; the rest go to the
+/// tooltip.
+const MAX_FRACTION_ENTRIES: usize = 4;
+
+/// Which collected wells a peak's window ran into.
+///
+/// An empty answer is never left blank: "this run collected nothing here" and
+/// "an Analysis CSV cannot tell us" are different statements, and a table that
+/// renders them identically invites the wrong conclusion. Both show `—`; the
+/// hover text says which one it is.
+fn fractions_cell(run: &Run, peak: &PeakResult) -> FractionsCell {
+    let dash = |hover: String| FractionsCell {
+        text: "—".to_string(),
+        hover,
+        wells_known: false,
+    };
+
+    if !run.source_format.supports_fractions() {
+        return dash(format!(
+            "{} carries no fraction records, so the wells behind this peak are unknown.",
+            run.source_format.label()
+        ));
+    }
+    if run.fractions.is_empty() {
+        return dash("No fractions were collected during this run.".to_string());
+    }
+
+    let overlapping = run
+        .fractions_overlapping(peak.v_start_ml, peak.v_end_ml)
+        .len();
+    let wells = run.wells_in_volume(peak.v_start_ml, peak.v_end_ml);
+    if wells.is_empty() {
+        return dash(if overlapping == 0 {
+            "No collected fraction overlaps this peak's volume window.".to_string()
+        } else {
+            // The fractions exist; only their rack type or pattern was unreadable.
+            format!(
+                "{overlapping} fraction(s) overlap this peak, but their plate positions could \
+                 not be resolved."
+            )
+        });
+    }
+
+    // Wells are listed in collection order — the order the peak actually filled
+    // them, which is what a user reading the chromatogram left to right expects.
+    // On a serpentine rack that is not alphabetical order.
+    let mut hover = format!(
+        "{} fraction(s): {}",
+        wells.len(),
+        elusive_core::wells::join_well_labels(&wells)
+    );
+    if overlapping > wells.len() {
+        hover.push_str(&format!(
+            "\n{} more overlap but have no resolved plate position.",
+            overlapping - wells.len()
+        ));
+    }
+
+    FractionsCell {
+        text: elusive_core::wells::format_well_list(&wells, Some(MAX_FRACTION_ENTRIES)),
+        hover,
+        wells_known: true,
+    }
 }
 
 fn peak_supports_mw(run: &Run, peak: &PeakResult) -> bool {

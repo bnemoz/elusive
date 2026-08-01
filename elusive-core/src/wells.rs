@@ -121,6 +121,89 @@ pub fn tube_for_well(
     Some(index + 1)
 }
 
+/// Split a collection-ordered well list into contiguous runs, each returned as
+/// its inclusive `(first, last)` pair. A singleton run has `first == last`.
+///
+/// A run is only formed from wells in the same plate row whose columns step by a
+/// constant ±1, so `D5, D6, D7, D8` collapses and so does the descending
+/// `B12, B11, B10` that serpentine collection produces on odd rows. Nothing is
+/// collapsed across a row change: under serpentine, `A11, A12, B12, B11` is four
+/// consecutive tubes but no sane range notation covers it.
+///
+/// Runs shorter than three wells are left expanded — `D5–D6` is no shorter than
+/// `D5, D6` and reads as though something were being hidden between the two.
+pub fn well_runs(wells: &[Well]) -> Vec<(Well, Well)> {
+    let mut runs: Vec<(Well, Well)> = Vec::new();
+    let mut i = 0;
+    while i < wells.len() {
+        let start = wells[i];
+        let mut end = start;
+        let mut step: Option<i32> = None;
+        let mut j = i + 1;
+        while let Some(&next) = wells.get(j) {
+            if next.row != end.row {
+                break;
+            }
+            let delta = next.col as i32 - end.col as i32;
+            if delta != 1 && delta != -1 {
+                break;
+            }
+            if *step.get_or_insert(delta) != delta {
+                break;
+            }
+            end = next;
+            j += 1;
+        }
+        if j - i >= 3 {
+            runs.push((start, end));
+            i = j;
+        } else {
+            runs.push((start, start));
+            i += 1;
+        }
+    }
+    runs
+}
+
+/// Human-readable well list for a table cell, e.g. `D5–D8` or `A11, A12, B12`.
+///
+/// `max_entries` caps how many comma-separated entries are rendered; the rest are
+/// summarised as `+N more` so one wide peak cannot blow the column out. Pass
+/// `None` for the complete list. An empty input yields an empty string — the
+/// caller decides how to say "nothing", since "no fraction overlaps" and "this
+/// format carries no fractions" are different answers.
+pub fn format_well_list(wells: &[Well], max_entries: Option<usize>) -> String {
+    let runs = well_runs(wells);
+    let shown = max_entries.unwrap_or(runs.len()).min(runs.len());
+    let mut out = runs[..shown]
+        .iter()
+        .map(|&(a, b)| {
+            if a == b {
+                a.label()
+            } else {
+                // En dash for a span, matching the numeric ranges elsewhere.
+                format!("{}–{}", a.label(), b.label())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let counted: usize = runs[..shown]
+        .iter()
+        .map(|&(a, b)| (b.col as i32 - a.col as i32).unsigned_abs() as usize + 1)
+        .sum();
+    if counted < wells.len() {
+        out.push_str(&format!(" +{} more", wells.len() - counted));
+    }
+    out
+}
+
+/// Every well spelled out, comma-separated. Used where a range would have to be
+/// re-expanded by whatever reads it — CSV export and hover text.
+pub fn join_well_labels(wells: &[Well]) -> String {
+    wells.iter().map(Well::label).collect::<Vec<_>>().join(", ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,6 +304,66 @@ mod tests {
             assert!(seen.insert(well), "well {well} produced twice");
         }
         assert_eq!(seen.len(), 96);
+    }
+
+    /// `"D5"` → `Well{row: 3, col: 4}`, for readable test fixtures.
+    fn w(label: &str) -> Well {
+        let (row, col) = label.split_at(1);
+        Well::new(
+            row.as_bytes()[0] - b'A',
+            col.parse::<u8>().expect("column number") - 1,
+        )
+    }
+
+    #[test]
+    fn an_ascending_run_of_wells_collapses_to_a_range() {
+        let wells = [w("D5"), w("D6"), w("D7"), w("D8")];
+        assert_eq!(format_well_list(&wells, None), "D5–D8");
+    }
+
+    #[test]
+    fn a_descending_serpentine_run_collapses_in_collection_order() {
+        // Row B is odd, so the collector fills it B12 → B1.
+        let wells = [w("B12"), w("B11"), w("B10"), w("B9")];
+        assert_eq!(format_well_list(&wells, None), "B12–B9");
+    }
+
+    #[test]
+    fn a_run_is_never_collapsed_across_a_row_change() {
+        // Four consecutive serpentine tubes, but no range notation covers them.
+        let wells = [w("A11"), w("A12"), w("B12"), w("B11")];
+        assert_eq!(format_well_list(&wells, None), "A11, A12, B12, B11");
+    }
+
+    #[test]
+    fn two_adjacent_wells_stay_spelled_out() {
+        assert_eq!(format_well_list(&[w("D5"), w("D6")], None), "D5, D6");
+    }
+
+    #[test]
+    fn a_long_list_is_truncated_with_a_count_of_what_is_hidden() {
+        let wells = [w("A1"), w("A3"), w("A5"), w("A7"), w("A9"), w("A11")];
+        assert_eq!(format_well_list(&wells, Some(3)), "A1, A3, A5 +3 more");
+    }
+
+    #[test]
+    fn truncation_counts_wells_not_ranges() {
+        // One four-well range plus two singletons, shown two entries deep.
+        let wells = [w("C1"), w("C2"), w("C3"), w("C4"), w("E7"), w("G2")];
+        assert_eq!(format_well_list(&wells, Some(2)), "C1–C4, E7 +1 more");
+    }
+
+    #[test]
+    fn an_empty_well_list_renders_as_an_empty_string() {
+        assert_eq!(format_well_list(&[], None), "");
+        assert_eq!(format_well_list(&[], Some(4)), "");
+        assert_eq!(join_well_labels(&[]), "");
+    }
+
+    #[test]
+    fn joined_labels_never_collapse_a_range() {
+        let wells = [w("D5"), w("D6"), w("D7"), w("D8")];
+        assert_eq!(join_well_labels(&wells), "D5, D6, D7, D8");
     }
 
     #[test]

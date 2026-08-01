@@ -167,7 +167,7 @@ impl EluSiveApp {
         let (default_name, contents) = match kind {
             ExportKind::Peaks => (
                 format!("{}-peaks.csv", stem(run)),
-                sidecar::peaks_to_csv(&self.view.peaks),
+                sidecar::peaks_to_csv(run, &self.view.peaks),
             ),
             ExportKind::Wells => (
                 format!("{}-wells.csv", stem(run)),
@@ -741,7 +741,7 @@ fn reports(ui: &mut egui::Ui, run: &Run, view: &mut View, t: Theme) {
 
         ui.add_space(spacing::LG);
         panels::heading(ui, t, "Peak table preview");
-        let csv = sidecar::peaks_to_csv(&view.peaks);
+        let csv = sidecar::peaks_to_csv(run, &view.peaks);
         egui::ScrollArea::both()
             .id_salt("csv-preview")
             .max_height(200.0)
