@@ -30,8 +30,11 @@ an addition to the planned module list: a name-based XML flattener, needed becau
 them, and no real archive is available to read the hierarchy from.
 
 `elusive-app/src/` — `main.rs`, `app.rs`, `view.rs`, `theme.rs`, `egui_adapter.rs`,
-and `widgets/{mod,chromatogram,plate,panels}.rs`. `view.rs` holds all mutable UI
-state so widgets can take `&Run` and `&mut View` simultaneously.
+and `widgets/{mod,chromatogram,plate,panels,overview}.rs`. `view.rs` holds all
+mutable UI state so widgets can take `&Run` and `&mut View` simultaneously.
+`widgets/overview.rs` owns the Overview section's responsive column flow and its
+drag-to-rearrange cards; its layout arithmetic is pure and width-driven so it can
+be tested without a window.
 
 Tests: unit tests in every core module plus `elusive-core/tests/ngc_archive.rs`,
 which builds a synthetic `.ngcAnalysis` in memory and parses it end to end.

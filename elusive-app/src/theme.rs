@@ -29,6 +29,33 @@ impl Rgb {
         ((self.r as u32) << 16) | ((self.g as u32) << 8) | self.b as u32
     }
 
+    /// Parse a hand-typed sRGB colour: `#RRGGBB` or `RRGGBB`.
+    ///
+    /// Returns `None` on anything else rather than falling back to a colour, so a
+    /// caller editing a text field can leave a half-typed value alone instead of
+    /// flashing a shade the user never asked for.
+    pub fn from_hex_str(s: &str) -> Option<Rgb> {
+        let s = s.trim();
+        let digits = s.strip_prefix('#').unwrap_or(s);
+        // `u32::from_str_radix` accepts a leading `+`, so `+12345` would pass a
+        // length-only check and parse to a colour the user did not type. The
+        // digits are therefore validated explicitly.
+        if digits.len() != 6 || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let v = u32::from_str_radix(digits, 16).ok()?;
+        Some(Rgb::new(
+            ((v >> 16) & 0xFF) as u8,
+            ((v >> 8) & 0xFF) as u8,
+            (v & 0xFF) as u8,
+        ))
+    }
+
+    /// Canonical `#RRGGBB` form, for a hex field the user can read back and copy.
+    pub fn hex_string(self) -> String {
+        format!("#{:02X}{:02X}{:02X}", self.r, self.g, self.b)
+    }
+
     /// Blend towards `other` by `t` in 0..=1, in linear-ish sRGB space.
     ///
     /// Used for the plate ramp, where the interpolation has to be monotonic in
@@ -203,6 +230,60 @@ pub mod spacing {
     pub const XL: f32 = 24.0;
     pub const XXL: f32 = 32.0;
     pub const XXXL: f32 = 48.0;
+}
+
+/// Reading measures — how wide a block of prose or a label/value form may grow
+/// before it stops being readable (`DESIGN_SYSTEM.md` §5).
+///
+/// A card that fills the viewport is fine for a chromatogram and wrong for a
+/// form. On a 4K monitor a full-width card is ~3800 px, and a field whose label
+/// sits at the left edge and whose value sits at the right edge puts twelve
+/// pixels of meaning two feet apart: the eye has nothing to track along, so the
+/// row stops reading as a pair. Capping the *content* width and centring the
+/// remainder is the fix.
+pub mod measure {
+    /// Widest a label/value form may grow. Around 800 px is the conventional
+    /// upper end of a comfortable measure for 14 px body text.
+    pub const FORM_MAX: f32 = 800.0;
+
+    /// Narrowest a form may be squeezed to and still hold its widest content —
+    /// for the calibration panel that is the standard/MW/Ve point table. Below
+    /// this width the form takes the whole window instead of being capped, so a
+    /// small window degrades to full width rather than to a squeezed column.
+    pub const FORM_MIN: f32 = 480.0;
+
+    // A cap tighter than the usability floor would make the cap the bug.
+    const _: () = assert!(FORM_MAX > FORM_MIN);
+
+    /// Width reserved for the label side of a [`crate::widgets::panels::field`]
+    /// row. Fixed rather than measured so every field in the app aligns on the
+    /// same x, and so the column does not jitter as values change.
+    pub const FIELD_LABEL: f32 = 168.0;
+
+    /// Content width for a form, given the width its container offers.
+    ///
+    /// Width is the safe axis to constrain: unlike height it cannot feed back
+    /// into a parent's size (see `widgets::chromatogram::data_y_range` for the
+    /// loop this avoids). Never let a measured content *height* reach this.
+    pub fn content_width(available: f32) -> f32 {
+        if !available.is_finite() || available <= 0.0 {
+            return 0.0;
+        }
+        available.min(FORM_MAX)
+    }
+
+    /// Space to insert ahead of the content so it sits centred in `available`.
+    ///
+    /// Centring rather than pinning left matters because the cap is visible: a
+    /// left-pinned 800 px card on a 4K window reads as a rendering failure.
+    pub fn leading_pad(available: f32) -> f32 {
+        // Guarded before the subtraction, not after: an infinite `available`
+        // would otherwise survive `max` as an infinite gutter.
+        if !available.is_finite() {
+            return 0.0;
+        }
+        ((available - content_width(available)) * 0.5).max(0.0)
+    }
 }
 
 pub mod radius {
@@ -462,6 +543,78 @@ mod tests {
             chart::legend_color_or_series(Some(legible), color::WHITE, 3),
             legible
         );
+    }
+
+    #[test]
+    fn a_form_is_capped_on_a_wide_window_and_left_alone_on_a_narrow_one() {
+        // The bug this exists to prevent: a 4K viewport stretching a field row.
+        assert_eq!(measure::content_width(3840.0), measure::FORM_MAX);
+        assert_eq!(
+            measure::content_width(measure::FORM_MAX + 1.0),
+            measure::FORM_MAX
+        );
+        // Below the cap the form keeps every pixel it is offered.
+        assert_eq!(measure::content_width(640.0), 640.0);
+        assert_eq!(measure::content_width(measure::FORM_MAX), measure::FORM_MAX);
+    }
+
+    #[test]
+    fn a_window_narrower_than_the_usability_floor_still_gets_all_of_it() {
+        // Degrade to full width rather than to a column too tight for the
+        // calibration point table.
+        for available in [1.0, 120.0, measure::FORM_MIN - 1.0, measure::FORM_MIN] {
+            assert_eq!(measure::content_width(available), available);
+            assert_eq!(measure::leading_pad(available), 0.0);
+        }
+    }
+
+    #[test]
+    fn hex_strings_round_trip_with_or_without_the_hash() {
+        let teal = Rgb::new(0x2E, 0x95, 0x99);
+        assert_eq!(teal.hex_string(), "#2E9599");
+        assert_eq!(Rgb::from_hex_str("#2E9599"), Some(teal));
+        assert_eq!(Rgb::from_hex_str("2e9599"), Some(teal));
+        assert_eq!(Rgb::from_hex_str("  #2E9599  "), Some(teal));
+    }
+
+    #[test]
+    fn malformed_hex_is_rejected_rather_than_guessed_at() {
+        // A colour field is typed into character by character, so every
+        // intermediate state must be a clean rejection, never a panic and never
+        // a silently different colour.
+        for bad in [
+            "", "#", "#2E959", "#2E95999", "2E959G", "#+12345", "-123456", "#FFFF", "rebecca",
+        ] {
+            assert_eq!(Rgb::from_hex_str(bad), None, "{bad:?} should not parse");
+        }
+    }
+
+    #[test]
+    fn a_degenerate_width_produces_no_width_rather_than_a_negative_or_a_nan() {
+        // egui hands out a zero or slightly negative available width during the
+        // first frame of a collapsed panel; that must not become a NaN layout.
+        for available in [0.0, -1.0, -4000.0, f32::NAN, f32::INFINITY] {
+            let w = measure::content_width(available);
+            assert!(
+                w.is_finite() && w >= 0.0,
+                "content_width({available}) = {w}"
+            );
+            let pad = measure::leading_pad(available);
+            assert!(
+                pad.is_finite() && pad >= 0.0,
+                "leading_pad({available}) = {pad}"
+            );
+        }
+        assert_eq!(measure::content_width(f32::INFINITY), 0.0);
+    }
+
+    #[test]
+    fn the_capped_form_is_centred_in_what_is_left() {
+        let available = 3840.0;
+        let pad = measure::leading_pad(available);
+        assert_eq!(pad, (available - measure::FORM_MAX) / 2.0);
+        // Content plus both gutters accounts for the whole width.
+        assert_eq!(pad * 2.0 + measure::content_width(available), available);
     }
 
     #[test]

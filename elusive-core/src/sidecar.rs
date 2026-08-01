@@ -28,8 +28,9 @@
 
 use crate::error::{Error, Result};
 use crate::integrate::PlateMetric;
-use crate::model::{PeakResult, Run};
+use crate::model::{Color, PeakResult, Run};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Schema version written by this build.
@@ -86,6 +87,25 @@ pub struct ViewState {
     pub show_fractions: Option<bool>,
     #[serde(default)]
     pub plate_uniform_ramp: Option<bool>,
+    /// Navigation rail reduced to icons only.
+    #[serde(default)]
+    pub nav_collapsed: Option<bool>,
+    /// Overview card order, as the app's stable panel-id strings.
+    ///
+    /// Strings rather than an enum on purpose: the core has no opinion about
+    /// which cards the UI shows, and a sidecar written by a build with more
+    /// panels than this one must still load. The app is responsible for dropping
+    /// ids it does not know and appending panels the list does not mention.
+    #[serde(default)]
+    pub overview_order: Option<Vec<String>>,
+    /// Trace colours the user chose by hand, keyed by channel id.
+    ///
+    /// Absent in sidecars written before this field existed, hence the `Option`:
+    /// "this build never had the feature" and "the user cleared every override"
+    /// are different facts, and only the second should be allowed to wipe a
+    /// colour a future merge might want to keep.
+    #[serde(default)]
+    pub channel_colors: Option<BTreeMap<String, Color>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -220,13 +240,20 @@ pub fn save(path: impl AsRef<Path>, sidecar: &Sidecar) -> Result<()> {
 
 /// CSV export of the peak table.
 /// Schema fixed by `IMPLEMENTATION_PLAN.md` Phase 5.
-pub fn peaks_to_csv(peaks: &[PeakResult]) -> String {
+///
+/// `fractions` lists every well the peak's window overlaps, spelled out rather
+/// than ranged so a script does not have to expand `D5–D8` itself. It is empty
+/// both when no fraction overlaps and when the source format carries no
+/// fractions at all — the two are distinguished in the UI, not here.
+pub fn peaks_to_csv(run: &Run, peaks: &[PeakResult]) -> String {
     let mut out = String::from(
-        "peak_id,channel_id,v_start_ml,v_end_ml,apex_volume_ml,area,height,fwhm,estimated_mw\n",
+        "peak_id,channel_id,v_start_ml,v_end_ml,apex_volume_ml,area,height,fwhm,estimated_mw,fractions\n",
     );
     for p in peaks {
+        let fractions =
+            crate::wells::join_well_labels(&run.wells_in_volume(p.v_start_ml, p.v_end_ml));
         out.push_str(&format!(
-            "{},{},{:.4},{:.4},{:.4},{:.6},{:.6},{},{}\n",
+            "{},{},{:.4},{:.4},{:.4},{:.6},{:.6},{},{},{}\n",
             p.id.0,
             csv_escape(p.channel_id.as_str()),
             p.v_start_ml,
@@ -238,6 +265,45 @@ pub fn peaks_to_csv(peaks: &[PeakResult]) -> String {
             p.estimated_mw_kda
                 .map(|v| format!("{v:.3}"))
                 .unwrap_or_default(),
+            csv_escape(&fractions),
+        ));
+    }
+    out
+}
+
+/// Shown for a value the run does not carry. An empty Markdown cell reads as an
+/// oversight; an em dash reads as "not measured".
+const EM_DASH: &str = "—";
+
+/// The peak table as a GitHub-flavoured Markdown table.
+///
+/// Same columns and same numeric precision as [`peaks_to_csv`]: this is the CSV
+/// rendered for a human reader — an electronic notebook entry or an issue comment
+/// — so the two must never disagree about a value. The one deliberate difference
+/// is the peak column, which carries the `P1` label the plot annotates rather than
+/// the bare integer a script would parse. Numeric columns get the `---:` alignment
+/// marker, which is how Markdown expresses rule #4.
+pub fn peaks_to_markdown(peaks: &[PeakResult]) -> String {
+    let mut out = String::from(
+        "| Peak | Channel | Start (mL) | End (mL) | Ve (mL) | Area | Height | FWHM (mL) | \
+         Est. MW (kDa) |\n| ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+    );
+    for p in peaks {
+        out.push_str(&format!(
+            "| {} | {} | {:.4} | {:.4} | {:.4} | {:.6} | {:.6} | {} | {} |\n",
+            p.id,
+            md_escape(p.channel_id.as_str()),
+            p.v_start_ml,
+            p.v_end_ml,
+            p.apex_volume_ml,
+            p.area,
+            p.height,
+            p.fwhm_ml
+                .map(|v| format!("{v:.4}"))
+                .unwrap_or_else(|| EM_DASH.to_string()),
+            p.estimated_mw_kda
+                .map(|v| format!("{v:.3}"))
+                .unwrap_or_else(|| EM_DASH.to_string()),
         ));
     }
     out
@@ -261,6 +327,16 @@ pub fn wells_to_csv(rows: &[(crate::model::Well, String, PlateMetric, Option<f64
     out
 }
 
+/// Keep a channel name inside its Markdown cell.
+///
+/// A bare `|` would split the row into extra columns and silently shift every
+/// value one cell to the right; newlines would end the row outright.
+fn md_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('|', "\\|")
+        .replace(['\n', '\r'], " ")
+}
+
 fn csv_escape(s: &str) -> String {
     if s.contains(',') || s.contains('"') || s.contains('\n') {
         format!("\"{}\"", s.replace('"', "\"\""))
@@ -273,7 +349,40 @@ fn csv_escape(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::calibration::{fit, CalibrationPoint, FitBasis};
-    use crate::model::{BaselineMode, ChannelId, PeakId, Well};
+    use crate::model::{BaselineMode, ChannelId, Fraction, PeakId, SourceFormat, Well};
+
+    fn sample_run(source_format: SourceFormat, fractions: Vec<Fraction>) -> Run {
+        Run {
+            meta: crate::model::RunMeta::default(),
+            source_format,
+            source_path: PathBuf::from("run.ngcAnalysis"),
+            channels: Vec::new(),
+            fractions,
+            events: Vec::new(),
+            warnings: Vec::new(),
+        }
+    }
+
+    /// A fraction occupying `[start, start + 1)` in the given well.
+    fn sample_fraction(tube: u32, start: f32, well: Well) -> Fraction {
+        Fraction {
+            tube,
+            rack: 1,
+            well: Some(well),
+            vol_start_ml: start,
+            vol_end_ml: start + 1.0,
+            time_start_s: 0.0,
+            time_end_s: 0.0,
+            nominal_size_ml: Some(1.0),
+            end_estimated: false,
+            rack_type: "HEP96".into(),
+            pattern: "Serpentine".into(),
+        }
+    }
+
+    fn fractionless_run() -> Run {
+        sample_run(SourceFormat::NgcAnalysis, Vec::new())
+    }
 
     fn sample_peak() -> PeakResult {
         PeakResult {
@@ -316,6 +425,28 @@ mod tests {
         let json = serde_json::to_string_pretty(&s).unwrap();
         let back = from_json(&json).unwrap();
         assert_eq!(s, back);
+    }
+
+    #[test]
+    fn user_trace_colours_survive_a_round_trip_and_are_optional_on_the_wire() {
+        let mut s = Sidecar::default();
+        s.view.channel_colors = Some(BTreeMap::from([(
+            "MWave2".to_string(),
+            Color::new(0xC4, 0x77, 0x3D, 0xFF),
+        )]));
+        let back = from_json(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.view.channel_colors, s.view.channel_colors);
+
+        // A sidecar written before the field existed must still load; refusing it
+        // would strand every analysis saved by an earlier build.
+        let legacy = r#"{
+            "version": 1,
+            "source": { "file_name": "run.ngcAnalysis", "run_name": "SEC", "channel_ids": [] },
+            "view": { "visible_channels": ["MWave2"], "dark_mode": true }
+        }"#;
+        let old = from_json(legacy).expect("a pre-colour sidecar should still parse");
+        assert_eq!(old.view.channel_colors, None);
+        assert_eq!(old.view.visible_channels, vec!["MWave2".to_string()]);
     }
 
     #[test]
@@ -382,6 +513,15 @@ mod tests {
     }
 
     #[test]
+    fn a_sidecar_written_before_overview_order_existed_still_loads() {
+        let json = r#"{"version": 1, "source": {"file_name":"run.ngcAnalysis","run_name":"r"},
+            "view": {"visible_channels":["MWave2"],"show_fractions":true}}"#;
+        let s = from_json(json).unwrap();
+        assert_eq!(s.view.visible_channels, vec!["MWave2".to_string()]);
+        assert!(s.view.overview_order.is_none());
+    }
+
+    #[test]
     fn malformed_json_reports_a_sidecar_error_not_a_panic() {
         assert!(matches!(from_json("{not json"), Err(Error::Sidecar { .. })));
         assert!(matches!(from_json("{}"), Err(Error::Sidecar { .. })));
@@ -424,16 +564,76 @@ mod tests {
 
     #[test]
     fn peak_csv_matches_the_agreed_schema() {
-        let csv = peaks_to_csv(&[sample_peak()]);
+        let csv = peaks_to_csv(&fractionless_run(), &[sample_peak()]);
         let mut lines = csv.lines();
         assert_eq!(
             lines.next().unwrap(),
-            "peak_id,channel_id,v_start_ml,v_end_ml,apex_volume_ml,area,height,fwhm,estimated_mw"
+            "peak_id,channel_id,v_start_ml,v_end_ml,apex_volume_ml,area,height,fwhm,estimated_mw,\
+             fractions"
         );
         let row = lines.next().unwrap();
         assert!(row.starts_with("1,MWave2,12.0000,14.0000,13.0000,"));
-        // An unset MW must be an empty cell, never a zero that reads as a result.
-        assert!(row.ends_with(','), "row = {row}");
+        // An unset MW must be an empty cell, never a zero that reads as a result;
+        // with no fractions collected the last cell is empty too.
+        assert!(row.ends_with(",,"), "row = {row}");
+    }
+
+    #[test]
+    fn the_fraction_cell_is_quoted_because_it_holds_a_comma_separated_list() {
+        let run = sample_run(
+            SourceFormat::NgcAnalysis,
+            vec![
+                sample_fraction(1, 12.0, Well::new(3, 4)),
+                sample_fraction(2, 13.0, Well::new(3, 5)),
+            ],
+        );
+        let csv = peaks_to_csv(&run, &[sample_peak()]);
+        let row = csv.lines().nth(1).expect("one data row");
+        assert!(row.ends_with(",\"D5, D6\""), "row = {row}");
+
+        // Round trip: a naive split on commas outside quotes must recover the
+        // field intact, commas and all.
+        assert_eq!(unquote_last_field(row), "D5, D6");
+    }
+
+    #[test]
+    fn a_csv_import_exports_an_empty_fraction_cell_rather_than_a_guess() {
+        // `SourceFormat::AnalysisCsv` cannot carry fractions at all, so there is
+        // nothing honest to write here.
+        let run = sample_run(SourceFormat::AnalysisCsv, Vec::new());
+        assert!(!run.source_format.supports_fractions());
+        let row = peaks_to_csv(&run, &[sample_peak()])
+            .lines()
+            .nth(1)
+            .map(str::to_owned)
+            .expect("one data row");
+        assert!(row.ends_with(",,"), "row = {row}");
+    }
+
+    /// Minimal RFC-4180 reader for the final field of a row, used to prove the
+    /// quoting survives a parse rather than merely looking right.
+    fn unquote_last_field(row: &str) -> String {
+        let mut fields = vec![String::new()];
+        let mut in_quotes = false;
+        let mut chars = row.chars().peekable();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '"' if in_quotes && chars.peek() == Some(&'"') => {
+                    chars.next();
+                    if let Some(last) = fields.last_mut() {
+                        last.push('"');
+                    }
+                }
+                '"' => in_quotes = !in_quotes,
+                ',' if !in_quotes => fields.push(String::new()),
+                _ => {
+                    if let Some(last) = fields.last_mut() {
+                        last.push(ch);
+                    }
+                }
+            }
+        }
+        fields.pop().unwrap_or_default()
     }
 
     #[test]
@@ -467,9 +667,55 @@ mod tests {
     }
 
     #[test]
+    fn peak_markdown_has_a_header_an_alignment_row_and_one_row_per_peak() {
+        let md = peaks_to_markdown(&[sample_peak()]);
+        let lines: Vec<&str> = md.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(
+            lines[0],
+            "| Peak | Channel | Start (mL) | End (mL) | Ve (mL) | Area | Height | FWHM (mL) | \
+             Est. MW (kDa) |"
+        );
+        // Numeric columns are right-aligned; only the channel name is not.
+        assert_eq!(
+            lines[1],
+            "| ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+        );
+        assert_eq!(
+            lines[2],
+            "| P1 | MWave2 | 12.0000 | 14.0000 | 13.0000 | 1234.500000 | 890.000000 | 0.8000 | — |"
+        );
+        // Every row has the same cell count, or a Markdown renderer drops cells.
+        for line in &lines {
+            assert_eq!(line.matches('|').count(), 10, "line = {line}");
+        }
+    }
+
+    #[test]
+    fn peak_markdown_with_no_peaks_is_still_a_valid_table() {
+        let md = peaks_to_markdown(&[]);
+        assert_eq!(md.lines().count(), 2);
+        assert!(md.ends_with("|\n"));
+    }
+
+    #[test]
+    fn a_pipe_in_a_channel_name_cannot_forge_a_column() {
+        let mut p = sample_peak();
+        p.channel_id = ChannelId::from("UV|280");
+        let md = peaks_to_markdown(&[p]);
+        let row = md.lines().nth(2).unwrap();
+        assert!(row.contains("UV\\|280"), "row = {row}");
+        // The escaped pipe still counts as a `|` character, so compare against the
+        // header instead of a bare count.
+        let header_cells = md.lines().next().unwrap().matches('|').count();
+        assert_eq!(row.matches("\\|").count(), 1);
+        assert_eq!(row.matches('|').count() - 1, header_cells);
+    }
+
+    #[test]
     fn channel_ids_containing_commas_are_quoted() {
         let mut p = sample_peak();
         p.channel_id = ChannelId::from("UV,weird");
-        assert!(peaks_to_csv(&[p]).contains("\"UV,weird\""));
+        assert!(peaks_to_csv(&fractionless_run(), &[p]).contains("\"UV,weird\""));
     }
 }

@@ -78,6 +78,15 @@ Peak labels use `P1`, `P2`, … in 11 px semibold. Retention time remains a sepa
 - Card radius: **8 px**; large modal/splash surfaces: **12 px**.
 - Border: **1 px** `SLATE_200`; focus ring: **2 px** `BLUE_500`.
 - Use shadows sparingly. Prefer a border plus surface contrast.
+- **Measure:** a label/value form caps at **800 px** of content and centres in the
+  space left over; below **480 px** it takes the full width instead of shrinking
+  further. Data surfaces — chromatogram, plate, wide numeric tables — are exempt
+  and still use the whole viewport. A form that fills a 4K window separates a
+  label from its value by the width of the screen, and the row stops reading as
+  a pair.
+- Label/value rows put the label in a **fixed 168 px column** with the value
+  immediately beside it, never justified to the opposite edge. The fixed column
+  aligns every field in the app on one x and cannot jitter between frames.
 
 ## 6. Component rules
 
@@ -191,6 +200,13 @@ alone (rule #3):
 - A channel's ChromLab legend color may override `SERIES` **only if** it meets the
   contrast anchors (§3) on the current surface; otherwise fall back to `SERIES`.
 - The hero UV trace uses `chart::PRIMARY_TRACE` regardless of position.
+- A color the **user** picks from the legend swatch outranks all three, including
+  the contrast gate above. That gate exists to reject a color the *instrument*
+  happened to record; substituting a different one for a color the user typed
+  would make the hex field lie about what is on screen. When their pick falls
+  below `chart::MIN_TRACE_CONTRAST`, the legend shows a warning glyph plus a
+  tooltip beside the swatch — rule #3, never color alone — and draws it anyway.
+  Overrides are always opaque and are stored per channel in the sidecar.
 
 ### 10.5 Well and region states (status by shape + color, rule #3)
 - Empty vs collected vs selected wells differ by **fill + border**, not hue alone.

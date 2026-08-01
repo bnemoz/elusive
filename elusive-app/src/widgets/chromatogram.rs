@@ -6,11 +6,11 @@
 //! number the instrument measured, so it is not on the table.
 
 use crate::egui_adapter::{self as adapt, c, c_alpha, ca};
-use crate::theme::{chart, color, stroke, Theme};
+use crate::theme::{chart, color, spacing, stroke, Rgb, Theme};
 use crate::view::{Interaction, View};
 use egui::Ui;
 use egui_plot::{Line, Plot, PlotPoints, Polygon};
-use elusive_core::model::{AxisGroup, Channel, Run};
+use elusive_core::model::{AxisGroup, Channel, Color, Fraction, PeakId, PeakResult, Run};
 
 /// Fraction of the pane's height given to the hero (UV) group.
 const HERO_HEIGHT_SHARE: f32 = 0.55;
@@ -49,9 +49,14 @@ pub fn show(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) -> ChartOutcome {
     let mut outcome = ChartOutcome::default();
     let total = ui.available_height();
     let heights = group_heights(&groups, total);
+    let count = groups.len();
 
     for (idx, (group, height)) in groups.iter().zip(heights).enumerate() {
-        let (interaction, hovered) = plot_group(ui, run, view, t, *group, height, idx == 0);
+        let position = PlotPosition {
+            is_hero: idx == 0,
+            x_axis_label: x_axis_label_for(idx, count),
+        };
+        let (interaction, hovered) = plot_group(ui, run, view, t, *group, height, position);
         if interaction.is_some() {
             outcome.interaction = interaction;
         }
@@ -62,6 +67,32 @@ pub fn show(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) -> ChartOutcome {
         }
     }
     outcome
+}
+
+/// Where a plot sits in the stack, and what that implies for its chrome.
+///
+/// `is_hero` (top plot, own y-axis overlays) and the x-axis label (bottom plot
+/// only) are both derived from a plot's position but are otherwise unrelated,
+/// so they are bundled here rather than passed as two more bare `plot_group`
+/// arguments.
+#[derive(Clone, Copy)]
+struct PlotPosition {
+    is_hero: bool,
+    x_axis_label: &'static str,
+}
+
+/// The x-axis label for the plot at `idx` in a stack of `count` plots.
+///
+/// The stack is x-linked, so repeating "Elution volume (mL)" under every plot
+/// is clutter — but it still has to appear *somewhere*, including in the
+/// overwhelmingly common single-group (UV-only) view. Only the bottom-most
+/// plot gets it.
+fn x_axis_label_for(idx: usize, count: usize) -> &'static str {
+    if count > 0 && idx == count - 1 {
+        "Elution volume (mL)"
+    } else {
+        ""
+    }
 }
 
 /// Axis groups that currently have at least one visible channel, hero group first.
@@ -138,6 +169,89 @@ fn data_y_range(channels: &[(usize, &Channel)]) -> (f64, f64) {
     (lo, hi)
 }
 
+/// The peak facts the hover readout needs, lifted out of [`View`].
+///
+/// `label_formatter` holds its closure for as long as the `Plot` lives, which
+/// spans the `show` body that mutates `View`. Copying three `Copy` fields per
+/// peak up front settles that overlap without interior mutability.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct HoverPeak {
+    id: PeakId,
+    v_start_ml: f32,
+    v_end_ml: f32,
+}
+
+impl HoverPeak {
+    /// Peak windows arrive from a drag, so do not assume start precedes end.
+    fn covers(&self, x: f64) -> bool {
+        let (a, b) = if self.v_start_ml <= self.v_end_ml {
+            (self.v_start_ml, self.v_end_ml)
+        } else {
+            (self.v_end_ml, self.v_start_ml)
+        };
+        a as f64 <= x && x <= b as f64
+    }
+}
+
+/// The peaks that belong on one axis group's plot.
+///
+/// Same filter as `draw_peak_regions`: a conductivity peak must not be named
+/// while the pointer is over the UV plot, where its window means nothing.
+fn hover_peaks(run: &Run, peaks: &[PeakResult], group: AxisGroup) -> Vec<HoverPeak> {
+    peaks
+        .iter()
+        .filter(|p| {
+            run.channel(&p.channel_id)
+                .is_some_and(|c| c.kind.axis_group() == group)
+        })
+        .map(|p| HoverPeak {
+            id: p.id,
+            v_start_ml: p.v_start_ml,
+            v_end_ml: p.v_end_ml,
+        })
+        .collect()
+}
+
+/// The collected fraction covering `x`, if any.
+///
+/// Takes the first hit rather than asserting uniqueness: a malformed run can
+/// report overlapping windows, and a tooltip is not the place to discover that.
+/// `run.fractions` is not assumed sorted, so this is a scan.
+fn fraction_at(run: &Run, x: f64) -> Option<&Fraction> {
+    run.fractions.iter().find(|f| {
+        let (a, b) = f.volume_window();
+        f.has_usable_window() && a as f64 <= x && x <= b as f64
+    })
+}
+
+/// The hover readout under the cursor.
+///
+/// Volume and value alone leave the user cross-referencing the plate and the peak
+/// table by eye to answer "which tube is this, and did I integrate it?". The
+/// fraction and peak lines are omitted when they do not apply — a placeholder line
+/// is noise the eye still has to parse.
+fn hover_label(run: &Run, peaks: &[HoverPeak], unit: &str, x: f64, y: f64) -> String {
+    let mut out = format!("{} mL\n{}", adapt::num(x, 3), adapt::num(y, 3));
+    if !unit.is_empty() {
+        out.push(' ');
+        out.push_str(unit);
+    }
+    if let Some(f) = fraction_at(run, x) {
+        // Fall back to the tube number when the rack mapping is unresolved:
+        // `well` is `None` for rack types the parser cannot lay out.
+        let which = f
+            .well
+            .map(|w| w.label())
+            .unwrap_or_else(|| format!("tube {}", f.tube));
+        out.push_str(&format!("\nFraction {which}"));
+    }
+    if let Some(p) = peaks.iter().find(|p| p.covers(x)) {
+        // Matches the "Peak {n}" wording of the peak-detail panel.
+        out.push_str(&format!("\nPeak {}", p.id.0));
+    }
+    out
+}
+
 fn plot_group(
     ui: &mut Ui,
     run: &Run,
@@ -145,8 +259,12 @@ fn plot_group(
     t: Theme,
     group: AxisGroup,
     height: f32,
-    is_hero: bool,
+    position: PlotPosition,
 ) -> (Option<Interaction>, Option<f32>) {
+    let PlotPosition {
+        is_hero,
+        x_axis_label,
+    } = position;
     let channels: Vec<(usize, &Channel)> = run
         .channels
         .iter()
@@ -167,6 +285,11 @@ fn plot_group(
     // While integrating, dragging draws a selection instead of panning.
     let integrating = view.integrate_mode;
 
+    // Detached before the plot is built so the hover closure borrows nothing the
+    // `show` body below needs mutably.
+    let readout_peaks = hover_peaks(run, &view.peaks, group);
+    let readout_unit = unit.clone();
+
     let mut interaction = None;
     let mut hovered_volume = None;
     Plot::new(format!("chromatogram-{group:?}"))
@@ -182,14 +305,14 @@ fn plot_group(
             // plot — unreadable peak heights on the one trace that matters.
             .label_spacing(egui::Rangef::new(12.0, 20.0))
             .min_thickness(44.0)])
-        .x_axis_label(if is_hero { "" } else { "Elution volume (mL)" })
+        .x_axis_label(x_axis_label)
         .legend(egui_plot::Legend::default().position(egui_plot::Corner::RightTop))
-        .label_formatter(|pos| {
+        .label_formatter(move |pos| {
             let p = match pos {
                 egui_plot::HoverPosition::NearDataPoint { position, .. } => position,
                 egui_plot::HoverPosition::Elsewhere { position } => position,
             };
-            Some(format!("{:.3} mL\n{:.3}", p.x, p.y))
+            Some(hover_label(run, &readout_peaks, &readout_unit, p.x, p.y))
         })
         .show(ui, |plot_ui| {
             // Fixed, data-derived extent. Deliberately NOT `plot_ui.plot_bounds()`
@@ -263,6 +386,60 @@ fn plot_group(
     (interaction, hovered_volume)
 }
 
+fn to_rgb(color: Color) -> Rgb {
+    Rgb::new(color.r, color.g, color.b)
+}
+
+fn to_core_color(rgb: Rgb) -> Color {
+    // Traces are lines, not fills: an override is always fully opaque.
+    Color::new(rgb.r, rgb.g, rgb.b, 0xFF)
+}
+
+/// The colour a channel's trace is drawn in.
+///
+/// The single source of truth for both the plot and the legend swatch. The two
+/// used to resolve the colour independently, which is a bug waiting to happen:
+/// the moment they disagree the legend is documenting a colour the plot never
+/// drew, and the reader has no way to tell which one is lying.
+pub fn trace_color(channel: &Channel, index: usize, view: &View, t: Theme) -> Rgb {
+    resolve_trace_color(
+        view.channel_color(&channel.id).map(to_rgb),
+        view.hero_channel_id.as_ref() == Some(&channel.id),
+        channel.color.map(to_rgb),
+        t.panel_bg,
+        index,
+    )
+}
+
+/// Precedence: user override → hero trace → legible ChromLab colour → palette.
+///
+/// The override outranks the contrast gate that
+/// [`chart::legend_color_or_series`] applies to a ChromLab colour, and that
+/// asymmetry is deliberate. A colour the instrument happened to record is a
+/// default we are free to reject; a colour the user typed is an instruction, and
+/// silently substituting a different one would make the hex field lie. Poor
+/// legibility is reported next to the swatch instead (rule #3: never colour alone).
+fn resolve_trace_color(
+    user: Option<Rgb>,
+    is_hero: bool,
+    chromlab: Option<Rgb>,
+    surface: Rgb,
+    index: usize,
+) -> Rgb {
+    if let Some(rgb) = user {
+        return rgb;
+    }
+    if is_hero {
+        return chart::PRIMARY_TRACE;
+    }
+    chart::legend_color_or_series(chromlab, surface, index)
+}
+
+/// Whether a trace colour is too close to the surface to read reliably (§10.4).
+fn is_low_contrast(rgb: Rgb, surface: Rgb) -> bool {
+    rgb.contrast_ratio(surface) < chart::MIN_TRACE_CONTRAST
+}
+
 fn draw_channel(
     plot_ui: &mut egui_plot::PlotUi<'_>,
     channel: &Channel,
@@ -282,15 +459,8 @@ fn draw_channel(
         return;
     }
 
-    let is_hero = view.hero_channel_id.as_ref() == Some(&channel.id);
     let selected = view.selected_channel.as_ref() == Some(&channel.id);
-
-    let rgb = if is_hero {
-        chart::PRIMARY_TRACE
-    } else {
-        let legend = channel.color.map(|c| crate::theme::Rgb::new(c.r, c.g, c.b));
-        chart::legend_color_or_series(legend, t.panel_bg, index)
-    };
+    let rgb = trace_color(channel, index, view, t);
 
     let width = if selected {
         stroke::SELECTED_TRACE
@@ -491,6 +661,36 @@ fn baseline_points(
     vec![[peak.v_start_ml as f64, y0], [peak.v_end_ml as f64, y1]]
 }
 
+/// Width of the legend swatch. The dash patterns below are laid out against it,
+/// so they stay inside the rect.
+const SWATCH_WIDTH: f32 = 24.0;
+/// Taller than the 1.5 px line it contains: the swatch is a click target now, and
+/// a 10 px-high one is not something a user can reliably hit.
+const SWATCH_HEIGHT: f32 = 16.0;
+
+/// Draw a channel's line sample: colour plus dash pattern, because channels past
+/// the eighth are told apart by shape, not hue alone (§10.4).
+fn paint_swatch(painter: &egui::Painter, rect: egui::Rect, rgb: Rgb, dash: chart::Dash) {
+    let y = rect.center().y;
+    let s = egui::Stroke::new(stroke::TRACE, c(rgb));
+    let segment = |x0: f32, len: f32| {
+        painter.line_segment([egui::pos2(x0, y), egui::pos2(x0 + len, y)], s);
+    };
+    match dash {
+        chart::Dash::Solid => segment(rect.left(), rect.width()),
+        chart::Dash::Dashed => {
+            for seg in 0..2 {
+                segment(rect.left() + seg as f32 * 12.0, 8.0);
+            }
+        }
+        chart::Dash::Dotted => {
+            for seg in 0..4 {
+                segment(rect.left() + seg as f32 * 6.0, 2.0);
+            }
+        }
+    }
+}
+
 /// Legend with per-channel visibility, colour swatch, and unit — the control
 /// surface for Phase 2's show/hide requirement.
 pub fn legend(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) {
@@ -507,46 +707,43 @@ pub fn legend(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) {
                         view.set_channel_visible(&channel.id, visible);
                     }
 
-                    let is_hero = view.hero_channel_id.as_ref() == Some(&channel.id);
-                    let rgb = if is_hero {
-                        chart::PRIMARY_TRACE
-                    } else {
-                        let legend = channel.color.map(|c| crate::theme::Rgb::new(c.r, c.g, c.b));
-                        chart::legend_color_or_series(legend, t.panel_bg, i)
-                    };
+                    let rgb = trace_color(channel, i, view, t);
 
-                    // A swatch plus the dash pattern drawn into it: channels past the
-                    // eighth are told apart by shape, not hue alone (§10.4).
-                    let (rect, _) =
-                        ui.allocate_exact_size(egui::vec2(22.0, 10.0), egui::Sense::hover());
-                    let painter = ui.painter();
-                    let y = rect.center().y;
-                    match chart::series_dash(i) {
-                        chart::Dash::Solid => {
-                            painter.line_segment(
-                                [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
-                                egui::Stroke::new(stroke::TRACE, c(rgb)),
-                            );
-                        }
-                        chart::Dash::Dashed => {
-                            for seg in 0..2 {
-                                let x0 = rect.left() + seg as f32 * 12.0;
-                                painter.line_segment(
-                                    [egui::pos2(x0, y), egui::pos2(x0 + 8.0, y)],
-                                    egui::Stroke::new(stroke::TRACE, c(rgb)),
-                                );
-                            }
-                        }
-                        chart::Dash::Dotted => {
-                            for seg in 0..4 {
-                                let x0 = rect.left() + seg as f32 * 6.0;
-                                painter.line_segment(
-                                    [egui::pos2(x0, y), egui::pos2(x0 + 2.0, y)],
-                                    egui::Stroke::new(stroke::TRACE, c(rgb)),
-                                );
-                            }
-                        }
+                    let swatch = ui.allocate_response(
+                        egui::vec2(SWATCH_WIDTH, SWATCH_HEIGHT),
+                        egui::Sense::click(),
+                    );
+                    paint_swatch(ui.painter(), swatch.rect, rgb, chart::series_dash(i));
+                    let swatch = swatch
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text("Click to choose this trace's colour");
+
+                    // Scratch buffer for the hex field, reset on every visit so a
+                    // half-typed value from last time does not reappear.
+                    let hex_id = swatch.id.with("hex-entry");
+                    if swatch.clicked() {
+                        ui.data_mut(|d| d.remove::<String>(hex_id));
                     }
+
+                    if is_low_contrast(rgb, t.panel_bg) {
+                        // Rule #3: the problem with a colour is never reported by
+                        // colour alone, so this is a glyph with a tooltip.
+                        ui.label(
+                            egui::RichText::new("⚠")
+                                .font(adapt::font_micro())
+                                .color(c(color::WARNING_600)),
+                        )
+                        .on_hover_text(
+                            "Low contrast against the plot background — this trace may be hard to see",
+                        );
+                    }
+
+                    egui::Popup::from_toggle_button_response(&swatch)
+                        // The default closes on any click, which would dismiss the
+                        // popup the instant the user touched the colour wheel.
+                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                        .frame(adapt::card(t))
+                        .show(|ui| color_editor(ui, channel, i, view, t, hex_id));
 
                     let label = ui.selectable_label(
                         view.selected_channel.as_ref() == Some(&channel.id),
@@ -568,6 +765,95 @@ pub fn legend(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) {
                 });
             }
         });
+}
+
+/// The colour picker behind a legend swatch.
+///
+/// egui 0.35's `color_picker_color32` offers a wheel and R/G/B drag values but no
+/// hex field, and a hex code is how a colour actually travels between a figure, a
+/// protocol, and a colleague — so one is added here.
+fn color_editor(
+    ui: &mut Ui,
+    channel: &Channel,
+    index: usize,
+    view: &mut View,
+    t: Theme,
+    hex_id: egui::Id,
+) {
+    ui.set_max_width(240.0);
+    ui.label(
+        egui::RichText::new(&channel.name)
+            .font(adapt::font_h3())
+            .color(c(t.text_primary)),
+    );
+    ui.add_space(spacing::SM);
+
+    let current = trace_color(channel, index, view, t);
+    let mut picked = c(current);
+    // Opaque: a semi-transparent line reads as a different colour wherever it
+    // crosses a fraction zone, so the swatch would stop matching the trace.
+    if egui::color_picker::color_picker_color32(ui, &mut picked, egui::color_picker::Alpha::Opaque)
+    {
+        let rgb = Rgb::new(picked.r(), picked.g(), picked.b());
+        view.set_channel_color(&channel.id, to_core_color(rgb));
+        // Keep the hex field showing what the wheel just produced.
+        ui.data_mut(|d| d.insert_temp(hex_id, rgb.hex_string()));
+    }
+
+    ui.add_space(spacing::SM);
+    let mut text = ui
+        .data_mut(|d| d.get_temp::<String>(hex_id))
+        .unwrap_or_else(|| current.hex_string());
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new("Hex")
+                .font(adapt::font_micro())
+                .color(c(t.text_secondary)),
+        );
+        let edit = ui.add(
+            egui::TextEdit::singleline(&mut text)
+                .desired_width(90.0)
+                .font(adapt::font_code())
+                .hint_text("#RRGGBB"),
+        );
+        if edit.changed() {
+            // Only a complete, well-formed value is applied. Anything else leaves
+            // the trace alone while the user keeps typing.
+            if let Some(rgb) = Rgb::from_hex_str(&text) {
+                view.set_channel_color(&channel.id, to_core_color(rgb));
+            }
+        }
+    });
+    let parsed = Rgb::from_hex_str(&text);
+    ui.data_mut(|d| d.insert_temp(hex_id, text));
+
+    if parsed.is_none() {
+        ui.label(
+            egui::RichText::new("Enter six hex digits, e.g. #2F6FB3")
+                .font(adapt::font_micro())
+                .color(c(color::WARNING_600)),
+        );
+    } else if is_low_contrast(current, t.panel_bg) {
+        // The user's choice still wins — this only tells them what they are
+        // trading away (§10.4 rejects an *instrument* colour, not a chosen one).
+        ui.label(
+            egui::RichText::new("⚠ Low contrast against the plot background")
+                .font(adapt::font_micro())
+                .color(c(color::WARNING_600)),
+        );
+    }
+
+    ui.add_space(spacing::SM);
+    let overridden = view.channel_color(&channel.id).is_some();
+    if ui
+        .add_enabled(overridden, egui::Button::new("Reset to default"))
+        .on_disabled_hover_text("This channel is already using its default colour")
+        .clicked()
+    {
+        view.clear_channel_color(&channel.id);
+        // Drop the buffer too, so the field redraws from the restored default.
+        ui.data_mut(|d| d.remove::<String>(hex_id));
+    }
 }
 
 #[cfg(test)]
@@ -631,5 +917,249 @@ mod tests {
     fn an_empty_group_still_yields_a_usable_extent() {
         let (lo, hi) = data_y_range(&[]);
         assert!(hi > lo, "a degenerate range would make overlays invisible");
+    }
+
+    #[test]
+    fn a_single_group_view_still_gets_the_x_axis_label() {
+        // Regression: this is the overwhelmingly common UV-only view. The old
+        // `is_hero` check blanked the label here because the one plot is both
+        // the hero and the bottom of the stack.
+        assert_eq!(x_axis_label_for(0, 1), "Elution volume (mL)");
+    }
+
+    #[test]
+    fn a_stacked_view_labels_only_the_bottom_plot() {
+        assert_eq!(x_axis_label_for(0, 3), "");
+        assert_eq!(x_axis_label_for(1, 3), "");
+        assert_eq!(x_axis_label_for(2, 3), "Elution volume (mL)");
+    }
+
+    // --- hover readout ----------------------------------------------------
+
+    use elusive_core::model::{
+        BaselineMode, ChannelId, ChannelKind, RunMeta, Sample, SourceFormat, Well,
+    };
+
+    fn fraction(tube: u32, well: Option<Well>, start: f32, end: f32) -> Fraction {
+        Fraction {
+            tube,
+            rack: 1,
+            well,
+            vol_start_ml: start,
+            vol_end_ml: end,
+            time_start_s: 0.0,
+            time_end_s: 0.0,
+            nominal_size_ml: Some(end - start),
+            end_estimated: false,
+            rack_type: "HEP96".into(),
+            pattern: "Serpentine".into(),
+        }
+    }
+
+    fn peak(id: u32, channel: &str, start: f32, end: f32) -> PeakResult {
+        PeakResult {
+            id: PeakId(id),
+            channel_id: ChannelId::from(channel),
+            v_start_ml: start,
+            v_end_ml: end,
+            baseline: BaselineMode::DropToZero,
+            area: 1.0,
+            height: 1.0,
+            apex_volume_ml: (start + end) / 2.0,
+            fwhm_ml: None,
+            estimated_mw_kda: None,
+        }
+    }
+
+    /// UV and conductivity channels, fractions over 10..13 mL, deliberately not
+    /// stored in volume order.
+    fn hover_run() -> Run {
+        let mut uv = Channel::new("MWave2", "UV 280 nm", ChannelKind::Uv);
+        uv.samples = vec![Sample::new(0.0, 0.0, 0.0), Sample::new(600.0, 20.0, 1.0)];
+        let mut cond = Channel::new("Cond", "Conductivity", ChannelKind::Conductivity);
+        cond.samples = vec![Sample::new(0.0, 0.0, 0.0), Sample::new(600.0, 20.0, 1.0)];
+
+        Run {
+            meta: RunMeta::default(),
+            source_format: SourceFormat::NgcAnalysis,
+            source_path: std::path::PathBuf::from("t.ngcAnalysis"),
+            channels: vec![uv, cond],
+            fractions: vec![
+                fraction(3, Some(Well::new(3, 7)), 12.0, 13.0),
+                fraction(1, Some(Well::new(0, 0)), 10.0, 11.0),
+                fraction(2, Some(Well::new(0, 1)), 11.0, 12.0),
+            ],
+            events: Vec::new(),
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn hover_inside_a_fraction_and_a_peak_reports_both() {
+        let run = hover_run();
+        let peaks = hover_peaks(&run, &[peak(3, "MWave2", 11.8, 12.6)], AxisGroup::Uv);
+        let label = hover_label(&run, &peaks, "mAU", 12.48, 412.6);
+        assert_eq!(label, "12.480 mL\n412.600 mAU\nFraction D8\nPeak 3");
+    }
+
+    #[test]
+    fn hover_outside_every_window_reports_only_the_coordinates() {
+        let run = hover_run();
+        let peaks = hover_peaks(&run, &[peak(1, "MWave2", 11.0, 12.0)], AxisGroup::Uv);
+        let label = hover_label(&run, &peaks, "mAU", 4.0, 1.5);
+        // An "n/a" line would still cost the eye a read, so it is left out.
+        assert_eq!(label, "4.000 mL\n1.500 mAU");
+    }
+
+    #[test]
+    fn hover_inside_a_fraction_without_a_peak_omits_the_peak_line() {
+        let run = hover_run();
+        let label = hover_label(&run, &[], "mAU", 10.5, 22.0);
+        assert_eq!(label, "10.500 mL\n22.000 mAU\nFraction A1");
+    }
+
+    #[test]
+    fn a_peak_on_another_axis_group_is_not_reported() {
+        let run = hover_run();
+        let all = vec![peak(4, "Cond", 10.0, 11.0)];
+
+        // Hovering UV: the conductivity peak's window is meaningless here.
+        let uv = hover_peaks(&run, &all, AxisGroup::Uv);
+        assert!(uv.is_empty());
+        assert_eq!(
+            hover_label(&run, &uv, "mAU", 10.5, 22.0),
+            "10.500 mL\n22.000 mAU\nFraction A1"
+        );
+
+        // Hovering the conductivity plot: same peak, now in context.
+        let cond = hover_peaks(&run, &all, AxisGroup::Conductivity);
+        assert!(hover_label(&run, &cond, "mS/cm", 10.5, 3.0).ends_with("\nPeak 4"));
+    }
+
+    #[test]
+    fn a_peak_whose_channel_is_gone_is_dropped_rather_than_shown_everywhere() {
+        let run = hover_run();
+        let orphan = vec![peak(9, "MWave0", 10.0, 11.0)];
+        assert!(hover_peaks(&run, &orphan, AxisGroup::Uv).is_empty());
+    }
+
+    #[test]
+    fn an_unmapped_rack_falls_back_to_the_tube_number() {
+        let mut run = hover_run();
+        run.fractions = vec![fraction(7, None, 10.0, 11.0)];
+        let label = hover_label(&run, &[], "mAU", 10.5, 1.0);
+        assert!(label.ends_with("\nFraction tube 7"), "{label}");
+    }
+
+    #[test]
+    fn a_degenerate_fraction_window_is_ignored() {
+        let mut run = hover_run();
+        // A zero-width or reversed window cannot contain the pointer in any
+        // meaningful sense; reporting it would name a tube at random.
+        run.fractions = vec![
+            fraction(1, Some(Well::new(0, 0)), 10.0, 10.0),
+            fraction(2, Some(Well::new(0, 1)), f32::NAN, 11.0),
+        ];
+        assert_eq!(
+            hover_label(&run, &[], "mAU", 10.0, 1.0),
+            "10.000 mL\n1.000 mAU"
+        );
+    }
+
+    #[test]
+    fn a_channel_without_a_display_unit_still_reads_cleanly() {
+        let run = hover_run();
+        let label = hover_label(&run, &[], "", 4.0, 1.5);
+        assert_eq!(
+            label, "4.000 mL\n1.500",
+            "no trailing space when unit is blank"
+        );
+    }
+
+    // --- trace colour resolution -----------------------------------------
+
+    const SURFACE: Rgb = crate::theme::color::WHITE;
+    const PICKED: Rgb = Rgb::new(0xC4, 0x77, 0x3D);
+    const CHROMLAB: Rgb = Rgb::new(0x20, 0x40, 0x60);
+
+    #[test]
+    fn a_chosen_colour_outranks_every_automatic_one() {
+        // Including the hero trace and a legible ChromLab colour: an explicit
+        // choice is an instruction, not a suggestion.
+        assert_eq!(
+            resolve_trace_color(Some(PICKED), true, Some(CHROMLAB), SURFACE, 3),
+            PICKED
+        );
+        assert_eq!(
+            resolve_trace_color(Some(PICKED), false, None, SURFACE, 3),
+            PICKED
+        );
+    }
+
+    #[test]
+    fn an_illegible_choice_is_still_honoured() {
+        // §10.4's contrast gate rejects an *instrument* colour. Substituting a
+        // different colour for one the user typed would make the hex field lie;
+        // the legend warns instead.
+        let washed_out = Rgb::new(0xFA, 0xFB, 0xFC);
+        assert_eq!(
+            resolve_trace_color(Some(washed_out), false, None, SURFACE, 3),
+            washed_out
+        );
+        assert!(is_low_contrast(washed_out, SURFACE));
+        assert!(!is_low_contrast(chart::PRIMARY_TRACE, SURFACE));
+    }
+
+    #[test]
+    fn without_an_override_the_documented_precedence_holds() {
+        // hero → legible ChromLab colour → series palette.
+        assert_eq!(
+            resolve_trace_color(None, true, Some(CHROMLAB), SURFACE, 3),
+            chart::PRIMARY_TRACE
+        );
+        assert_eq!(
+            resolve_trace_color(None, false, Some(CHROMLAB), SURFACE, 3),
+            CHROMLAB
+        );
+        assert_eq!(
+            resolve_trace_color(None, false, None, SURFACE, 3),
+            chart::series_color(3)
+        );
+        // An illegible instrument colour still loses to the palette.
+        assert_eq!(
+            resolve_trace_color(None, false, Some(Rgb::new(0xFA, 0xFB, 0xFC)), SURFACE, 3),
+            chart::series_color(3)
+        );
+    }
+
+    #[test]
+    fn the_plot_and_the_legend_read_the_same_colour_for_a_channel() {
+        // The regression this guards: two call sites resolving independently and
+        // drifting, so the legend documents a colour the plot never drew. Both
+        // now go through `trace_color`, which is what this exercises.
+        use elusive_core::model::{Channel, ChannelKind, Sample};
+
+        let mut uv = Channel::new("MWave2", "UV 280 nm", ChannelKind::Uv);
+        uv.samples = vec![Sample::new(0.0, 0.0, 0.0), Sample::new(60.0, 1.0, 0.5)];
+        uv.color = Some(Color::new(0x20, 0x40, 0x60, 0xFF));
+
+        let t = crate::theme::LIGHT;
+        let mut view = View::default();
+        view.hero_channel_id = Some(uv.id.clone());
+        assert_eq!(trace_color(&uv, 0, &view, t), chart::PRIMARY_TRACE);
+
+        view.set_channel_color(&uv.id, to_core_color(PICKED));
+        assert_eq!(trace_color(&uv, 0, &view, t), PICKED);
+
+        view.clear_channel_color(&uv.id);
+        view.hero_channel_id = None;
+        assert_eq!(trace_color(&uv, 0, &view, t), CHROMLAB);
+    }
+
+    #[test]
+    fn a_colour_survives_the_trip_through_the_core_representation() {
+        // The picker hands back an `Rgb`; the sidecar stores a core `Color`.
+        assert_eq!(to_rgb(to_core_color(PICKED)), PICKED);
+        assert_eq!(to_core_color(PICKED).a, 0xFF);
     }
 }

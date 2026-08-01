@@ -4,7 +4,7 @@
 //! line up by place value rather than by chance (`DESIGN_SYSTEM.md` rule #4).
 
 use crate::egui_adapter::{c, c_alpha, font_code, font_h3, font_micro, num};
-use crate::theme::{color, spacing, Theme};
+use crate::theme::{color, measure, spacing, Theme};
 use crate::view::View;
 use egui::Ui;
 use elusive_core::calibration::{self, FitBasis, BIORAD_GFS, LOW_CONFIDENCE_R2};
@@ -20,22 +20,80 @@ pub fn heading(ui: &mut Ui, t: Theme, text: &str) {
     ui.add_space(spacing::SM);
 }
 
-/// Label above a value, per §6 (labels above controls, units in the label).
+/// One row of a label/value form: label in a fixed-width left column, value
+/// immediately beside it. Units stay in the label, per §6.
+///
+/// This used to push the value to the far right with a nested right-to-left
+/// layout. In the 340 px detail rail that reads fine, which is why the bug hid
+/// for so long; in a card that fills a 4K window it separates a label from its
+/// value by most of the screen and the pair stops reading as a row.
+///
+/// A fixed column rather than an `egui::Grid`: a grid only aligns the rows
+/// inside it, and `field` is called one row at a time, interleaved with
+/// headings, warnings and drag fields. A constant keeps every field in the app
+/// on the same x, and cannot jitter as values change width between frames.
 pub fn field(ui: &mut Ui, t: Theme, label: &str, value: &str) {
     ui.horizontal(|ui| {
+        // Never let the label eat more than half of a narrow rail.
+        let column = measure::FIELD_LABEL
+            .min(ui.available_width() * 0.5)
+            .max(0.0);
+        ui.allocate_ui_with_layout(
+            egui::vec2(column, 0.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                // `allocate_ui_with_layout` shrinks its allocation to the content,
+                // so a short label would collapse the column and break alignment.
+                ui.set_min_width(column);
+                ui.label(
+                    egui::RichText::new(label)
+                        .font(font_micro())
+                        .color(c(t.text_secondary)),
+                );
+            },
+        );
         ui.label(
-            egui::RichText::new(label)
+            egui::RichText::new(value)
+                .font(font_code())
+                .color(c(t.text_primary)),
+        );
+    });
+}
+
+/// The header row of a data grid: 11 px secondary labels, one cell per column.
+///
+/// Shared so that every table in the app agrees on what a header looks like;
+/// callers still own the `Grid` itself, because column counts and interactivity
+/// differ from table to table.
+pub fn table_header_row(ui: &mut Ui, t: Theme, headers: &[&str]) {
+    for header in headers {
+        ui.label(
+            egui::RichText::new(*header)
                 .font(font_micro())
                 .color(c(t.text_secondary)),
         );
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+    }
+    ui.end_row();
+}
+
+/// A numeric grid cell, right-aligned inside a fixed-width box.
+///
+/// A grid cell sizes itself to its content, so `1234.5` and `9.0` start at the
+/// same left edge and the ones place drifts. Reserving a known width and laying
+/// out right-to-left inside it puts place value under place value (rule #4).
+fn num_cell(ui: &mut Ui, t: Theme, width: f32, text: &str) {
+    let height = ui.text_style_height(&egui::TextStyle::Monospace);
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, height),
+        egui::Layout::right_to_left(egui::Align::Center),
+        |ui| {
             ui.label(
-                egui::RichText::new(value)
+                egui::RichText::new(text)
                     .font(font_code())
                     .color(c(t.text_primary)),
             );
-        });
-    });
+        },
+    );
 }
 
 /// Run identity and provenance.
@@ -251,24 +309,21 @@ pub fn peak_table(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) {
                 .num_columns(9)
                 .spacing([spacing::LG, spacing::XS])
                 .show(ui, |ui| {
-                    for header in [
-                        "Peak",
-                        "Channel",
-                        "Ve (mL)",
-                        "Window (mL)",
-                        "Area",
-                        "Area %",
-                        "Height",
-                        "FWHM (mL)",
-                        "",
-                    ] {
-                        ui.label(
-                            egui::RichText::new(header)
-                                .font(font_micro())
-                                .color(c(t.text_secondary)),
-                        );
-                    }
-                    ui.end_row();
+                    table_header_row(
+                        ui,
+                        t,
+                        &[
+                            "Peak",
+                            "Channel",
+                            "Ve (mL)",
+                            "Window (mL)",
+                            "Area",
+                            "Area %",
+                            "Height",
+                            "FWHM (mL)",
+                            "",
+                        ],
+                    );
 
                     let peaks = view.peaks.clone();
                     for peak in &peaks {
@@ -333,6 +388,93 @@ pub fn peak_table(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) {
     if let Some(id) = to_delete {
         view.remove_peak(id);
     }
+}
+
+/// Run-independent columns in the peak preview.
+///
+/// The CSV adds a Fractions column, which requires the loaded run to resolve
+/// collection windows; this compact preview intentionally focuses on peak facts.
+const EXPORT_COLUMNS: [&str; 9] = [
+    "Peak",
+    "Channel",
+    "Start (mL)",
+    "End (mL)",
+    "Ve (mL)",
+    "Area",
+    "Height",
+    "FWHM (mL)",
+    "Est. MW (kDa)",
+];
+
+/// Reserved width per export column; `0.0` means "natural width, left aligned",
+/// which is what an identifier or a channel name wants.
+const EXPORT_WIDTHS: [f32; 9] = [0.0, 0.0, 60.0, 60.0, 60.0, 92.0, 92.0, 64.0, 80.0];
+
+/// The exported cells for one peak, at the precision the export writes.
+///
+/// Split out from the drawing code so the preview's agreement with
+/// `sidecar::peaks_to_csv` is a unit test rather than a promise. A value the run
+/// does not carry shows an em dash, never a zero that would read as a result.
+fn export_row(peak: &PeakResult) -> [String; EXPORT_COLUMNS.len()] {
+    [
+        peak.id.to_string(),
+        peak.channel_id.0.clone(),
+        num(peak.v_start_ml as f64, 4),
+        num(peak.v_end_ml as f64, 4),
+        num(peak.apex_volume_ml as f64, 4),
+        num(peak.area, 6),
+        num(peak.height, 6),
+        peak.fwhm_ml
+            .map(|v| num(v as f64, 4))
+            .unwrap_or_else(|| "—".to_string()),
+        peak.estimated_mw_kda
+            .map(|v| num(v, 3))
+            .unwrap_or_else(|| "—".to_string()),
+    ]
+}
+
+/// How tall the Reports preview may grow before it scrolls.
+///
+/// Bounded on purpose: a run with thirty peaks must not push the Sidecar section
+/// below the fold.
+const EXPORT_PREVIEW_MAX_HEIGHT: f32 = 200.0;
+
+/// A read-only preview of the peak export.
+///
+/// Same columns and same decimals as the CSV and Markdown writers, so the user is
+/// reading the file rather than a paraphrase of it. No zebra striping: §"Data
+/// tables" reserves row fill for selection, and nothing here is selectable.
+pub fn peak_export_preview(ui: &mut Ui, view: &View, t: Theme) {
+    if view.peaks.is_empty() {
+        ui.label(egui::RichText::new("No integrations to export yet.").color(c(t.text_secondary)));
+        return;
+    }
+
+    egui::ScrollArea::both()
+        .id_salt("peak-export-preview")
+        .max_height(EXPORT_PREVIEW_MAX_HEIGHT)
+        .show(ui, |ui| {
+            egui::Grid::new("peak-export")
+                .num_columns(EXPORT_COLUMNS.len())
+                .spacing([spacing::MD, spacing::XS])
+                .show(ui, |ui| {
+                    table_header_row(ui, t, &EXPORT_COLUMNS);
+                    for peak in &view.peaks {
+                        for (cell, width) in export_row(peak).iter().zip(EXPORT_WIDTHS) {
+                            if width > 0.0 {
+                                num_cell(ui, t, width, cell);
+                            } else {
+                                ui.label(
+                                    egui::RichText::new(cell)
+                                        .font(font_code())
+                                        .color(c(t.text_primary)),
+                                );
+                            }
+                        }
+                        ui.end_row();
+                    }
+                });
+        });
 }
 
 /// Right-rail detail card for the selected peak, plus its shape mini-view.
@@ -798,24 +940,22 @@ pub fn results_table(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) {
     let cal = view.calibration.clone();
 
     egui::Grid::new("results")
-        .num_columns(6)
+        .num_columns(7)
         .spacing([spacing::LG, spacing::XS])
         .show(ui, |ui| {
-            for header in [
-                "Peak",
-                "Channel",
-                "Ve (mL)",
-                "Area",
-                "Est. MW (kDa)",
-                "Conc. (mg/mL)",
-            ] {
-                ui.label(
-                    egui::RichText::new(header)
-                        .font(font_micro())
-                        .color(c(t.text_secondary)),
-                );
-            }
-            ui.end_row();
+            table_header_row(
+                ui,
+                t,
+                &[
+                    "Peak",
+                    "Channel",
+                    "Ve (mL)",
+                    "Area",
+                    "Est. MW (kDa)",
+                    "Conc. (mg/mL)",
+                    "Fractions",
+                ],
+            );
 
             for peak in &view.peaks {
                 ui.label(egui::RichText::new(peak.id.to_string()).font(font_code()));
@@ -853,9 +993,94 @@ pub fn results_table(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) {
                     "—".to_string()
                 };
                 ui.label(egui::RichText::new(conc).font(font_code()));
+
+                let cell = fractions_cell(run, peak);
+                ui.label(egui::RichText::new(&cell.text).font(font_code()).color(c(
+                    if cell.wells_known {
+                        t.text_primary
+                    } else {
+                        t.text_secondary
+                    },
+                )))
+                .on_hover_text(&cell.hover);
                 ui.end_row();
             }
         });
+}
+
+/// The Fractions cell for one peak: what to print, and what to explain on hover.
+struct FractionsCell {
+    text: String,
+    hover: String,
+    /// False when the cell is a dash, so the dash can be dimmed like the other
+    /// "we do not know" values in this table rather than reading as data.
+    wells_known: bool,
+}
+
+/// How many entries fit before the column starts to distort the table. A peak
+/// over a long shallow shoulder can touch dozens of tubes; the rest go to the
+/// tooltip.
+const MAX_FRACTION_ENTRIES: usize = 4;
+
+/// Which collected wells a peak's window ran into.
+///
+/// An empty answer is never left blank: "this run collected nothing here" and
+/// "an Analysis CSV cannot tell us" are different statements, and a table that
+/// renders them identically invites the wrong conclusion. Both show `—`; the
+/// hover text says which one it is.
+fn fractions_cell(run: &Run, peak: &PeakResult) -> FractionsCell {
+    let dash = |hover: String| FractionsCell {
+        text: "—".to_string(),
+        hover,
+        wells_known: false,
+    };
+
+    if !run.source_format.supports_fractions() {
+        return dash(format!(
+            "{} carries no fraction records, so the wells behind this peak are unknown.",
+            run.source_format.label()
+        ));
+    }
+    if run.fractions.is_empty() {
+        return dash("No fractions were collected during this run.".to_string());
+    }
+
+    let overlapping = run
+        .fractions_overlapping(peak.v_start_ml, peak.v_end_ml)
+        .len();
+    let wells = run.wells_in_volume(peak.v_start_ml, peak.v_end_ml);
+    if wells.is_empty() {
+        return dash(if overlapping == 0 {
+            "No collected fraction overlaps this peak's volume window.".to_string()
+        } else {
+            // The fractions exist; only their rack type or pattern was unreadable.
+            format!(
+                "{overlapping} fraction(s) overlap this peak, but their plate positions could \
+                 not be resolved."
+            )
+        });
+    }
+
+    // Wells are listed in collection order — the order the peak actually filled
+    // them, which is what a user reading the chromatogram left to right expects.
+    // On a serpentine rack that is not alphabetical order.
+    let mut hover = format!(
+        "{} fraction(s): {}",
+        wells.len(),
+        elusive_core::wells::join_well_labels(&wells)
+    );
+    if overlapping > wells.len() {
+        hover.push_str(&format!(
+            "\n{} more overlap but have no resolved plate position.",
+            overlapping - wells.len()
+        ));
+    }
+
+    FractionsCell {
+        text: elusive_core::wells::format_well_list(&wells, Some(MAX_FRACTION_ENTRIES)),
+        hover,
+        wells_known: true,
+    }
 }
 
 fn peak_supports_mw(run: &Run, peak: &PeakResult) -> bool {
@@ -883,4 +1108,74 @@ fn estimated_mw_for_peak(
         return None;
     }
     calibration.and_then(|cal| cal.mw_for_volume(peak.apex_volume_ml))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use elusive_core::model::{BaselineMode, ChannelId, PeakId, Run, RunMeta, SourceFormat};
+    use elusive_core::sidecar;
+
+    fn sample_peak() -> PeakResult {
+        PeakResult {
+            id: PeakId(1),
+            channel_id: ChannelId::from("MWave2"),
+            v_start_ml: 12.0,
+            v_end_ml: 14.0,
+            baseline: BaselineMode::LinearEndpoints,
+            area: 1234.5,
+            height: 890.0,
+            apex_volume_ml: 13.0,
+            fwhm_ml: Some(0.8),
+            estimated_mw_kda: None,
+        }
+    }
+
+    #[test]
+    fn every_export_column_has_a_cell_and_a_width() {
+        assert_eq!(EXPORT_COLUMNS.len(), EXPORT_WIDTHS.len());
+        assert_eq!(export_row(&sample_peak()).len(), EXPORT_COLUMNS.len());
+    }
+
+    #[test]
+    fn the_preview_excludes_only_the_run_dependent_fraction_column() {
+        let run = Run {
+            meta: RunMeta::default(),
+            source_format: SourceFormat::AnalysisCsv,
+            source_path: "test.csv".into(),
+            channels: Vec::new(),
+            fractions: Vec::new(),
+            events: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let header = sidecar::peaks_to_csv(&run, &[]);
+        let columns: Vec<_> = header.trim_end().split(',').collect();
+        assert_eq!(columns.len(), EXPORT_COLUMNS.len() + 1);
+        assert_eq!(columns.last(), Some(&"fractions"));
+    }
+
+    #[test]
+    fn preview_cells_match_the_markdown_export_value_for_value() {
+        let peak = sample_peak();
+        let cells = export_row(&peak);
+        let md = sidecar::peaks_to_markdown(std::slice::from_ref(&peak));
+        let row: Vec<&str> = md
+            .lines()
+            .nth(2)
+            .expect("one peak produces one body row")
+            .trim_matches('|')
+            .split('|')
+            .map(str::trim)
+            .collect();
+        assert_eq!(row, cells.iter().map(String::as_str).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn an_unmeasured_value_shows_a_dash_not_a_zero() {
+        let mut peak = sample_peak();
+        peak.fwhm_ml = None;
+        let cells = export_row(&peak);
+        assert_eq!(cells[7], "—");
+        assert_eq!(cells[8], "—");
+    }
 }

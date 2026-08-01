@@ -6,15 +6,31 @@
 //! top, HEP96 plate below, hover in either direction.
 
 use crate::egui_adapter::{self as adapt, c, Mode};
-use crate::theme::{color, spacing, Theme};
+use crate::theme::{color, measure, spacing, Theme};
 use crate::view::{BaselineChoice, Interaction, Section, View};
-use crate::widgets::{chromatogram, panels, plate};
+use crate::widgets::{self, chromatogram, panels, plate};
 use elusive_core::integrate::{integrate_peak, PlateMetric};
 use elusive_core::model::Run;
 use elusive_core::sidecar;
 
 /// How long a status message stays on screen, in frames-independent seconds.
 const STATUS_TTL_SECS: f64 = 8.0;
+
+/// Navigation rail width with section names showing.
+const NAV_WIDTH_EXPANDED: f32 = 200.0;
+/// Navigation rail width with icons only.
+const NAV_WIDTH_COLLAPSED: f32 = 56.0;
+/// How long the rail takes to slide between the two widths.
+///
+/// Rule #5 — animation never delays an analytical action — so this stays well
+/// inside the threshold where a transition still reads as instant. The design
+/// system names no motion token, and `apply` already pins egui's own
+/// `animation_time` to 50 ms for the same reason.
+const NAV_ANIM_SECS: f32 = 0.12;
+/// Glyph on the toggle when the rail is expanded, i.e. clicking collapses it.
+const NAV_COLLAPSE_GLYPH: &str = "⏴";
+/// Glyph on the toggle when the rail is collapsed.
+const NAV_EXPAND_GLYPH: &str = "⏵";
 
 pub struct EluSiveApp {
     run: Option<Run>,
@@ -167,7 +183,7 @@ impl EluSiveApp {
         let (default_name, contents) = match kind {
             ExportKind::Peaks => (
                 format!("{}-peaks.csv", stem(run)),
-                sidecar::peaks_to_csv(&self.view.peaks),
+                sidecar::peaks_to_csv(run, &self.view.peaks),
             ),
             ExportKind::Wells => (
                 format!("{}-wells.csv", stem(run)),
@@ -232,33 +248,90 @@ impl EluSiveApp {
 
     fn nav(&mut self, ui: &mut egui::Ui) {
         let t = self.theme;
+        let collapsed = self.view.nav_collapsed;
+        // `animate_bool_with_time` also drives the repaints the slide needs, so
+        // the rail keeps moving without anything else asking for frames.
+        let layout = nav_layout(ui.ctx().animate_bool_with_time(
+            egui::Id::new("nav-collapse"),
+            !collapsed,
+            NAV_ANIM_SECS,
+        ));
+
         egui::Panel::left("nav")
-            .exact_size(200.0)
+            .exact_size(layout.width)
             .resizable(false)
             .frame(adapt::nav_frame(t))
             .show(ui, |ui| {
+                if !layout.labels {
+                    // The standard 12 px button padding would leave a 56 px rail
+                    // about 8 px for the glyph, which egui resolves by wrapping
+                    // the icon out of sight.
+                    ui.spacing_mut().button_padding.x = spacing::XS;
+                }
+
                 ui.add_space(spacing::SM);
-                ui.label(
-                    egui::RichText::new("EluSive")
-                        .font(adapt::font_h1())
-                        .color(c(color::WHITE))
-                        .strong(),
-                );
-                ui.label(
-                    egui::RichText::new("Precise analysis.\nInvisible by design.")
-                        .font(adapt::font_micro())
-                        .color(c(color::BLUE_300)),
-                );
+                let toggle = ui
+                    .horizontal(|ui| {
+                        if layout.labels {
+                            ui.label(
+                                egui::RichText::new("EluSive")
+                                    .font(adapt::font_h1())
+                                    .color(c(color::WHITE))
+                                    .strong(),
+                            );
+                        }
+                        // Right-aligned when the wordmark is present, otherwise
+                        // it is the only thing on the row either way.
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_sized(
+                                [
+                                    crate::theme::control::HEIGHT_COMPACT,
+                                    crate::theme::control::HEIGHT_COMPACT,
+                                ],
+                                egui::Button::new(
+                                    egui::RichText::new(if collapsed {
+                                        NAV_EXPAND_GLYPH
+                                    } else {
+                                        NAV_COLLAPSE_GLYPH
+                                    })
+                                    .color(c(color::BLUE_300)),
+                                ),
+                            )
+                        })
+                        .inner
+                    })
+                    .inner
+                    .on_hover_text(if collapsed {
+                        "Expand navigation"
+                    } else {
+                        "Collapse navigation"
+                    });
+                if toggle.clicked() {
+                    self.view.set_nav_collapsed(!collapsed);
+                }
+
+                if layout.labels {
+                    ui.label(
+                        egui::RichText::new("Precise analysis.\nInvisible by design.")
+                            .font(adapt::font_micro())
+                            .color(c(color::BLUE_300)),
+                    );
+                }
                 ui.add_space(spacing::LG);
 
                 for section in Section::ALL {
                     let active = self.view.section == section;
+                    let caption = if layout.labels {
+                        format!("{}  {}", section.icon(), section.label())
+                    } else {
+                        section.icon().to_string()
+                    };
                     // Active item: INK_800 fill plus a 2 px BLUE_500 indicator (§6).
-                    let response = ui.add_sized(
+                    let mut response = ui.add_sized(
                         [ui.available_width(), crate::theme::control::HEIGHT_COMPACT],
                         egui::Button::selectable(
                             active,
-                            egui::RichText::new(section.label()).color(c(if active {
+                            egui::RichText::new(caption).color(c(if active {
                                 color::WHITE
                             } else {
                                 color::BLUE_300
@@ -266,6 +339,9 @@ impl EluSiveApp {
                         ),
                     );
                     if active {
+                        // Painted inside the button's own rect, which starts at
+                        // the frame's content edge, so the indicator survives the
+                        // narrower rail rather than being clipped by the margin.
                         let rect = response.rect;
                         ui.painter().rect_filled(
                             egui::Rect::from_min_size(
@@ -276,6 +352,11 @@ impl EluSiveApp {
                             c(color::BLUE_500),
                         );
                     }
+                    if !layout.labels {
+                        // Rule #3: an icon on its own is appearance-only status.
+                        // The tooltip is what gives the control a name.
+                        response = response.on_hover_text(section.label());
+                    }
                     if response.clicked() {
                         self.view.section = section;
                     }
@@ -284,21 +365,31 @@ impl EluSiveApp {
                 // Settings and help pinned to the bottom (§11).
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                     ui.add_space(spacing::SM);
-                    if !self.missing_fonts.is_empty() {
+                    if layout.labels {
+                        if !self.missing_fonts.is_empty() {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Using fallback fonts ({})",
+                                    self.missing_fonts.join(", ")
+                                ))
+                                .font(adapt::font_micro())
+                                .color(c(color::BLUE_300)),
+                            );
+                        }
                         ui.label(
-                            egui::RichText::new(format!(
-                                "Using fallback fonts ({})",
-                                self.missing_fonts.join(", ")
-                            ))
-                            .font(adapt::font_micro())
-                            .color(c(color::BLUE_300)),
+                            egui::RichText::new(concat!("v", env!("CARGO_PKG_VERSION")))
+                                .font(adapt::font_micro())
+                                .color(c(color::BLUE_300)),
                         );
+                    } else {
+                        let (marker, detail) = nav_footer(&self.missing_fonts);
+                        ui.label(
+                            egui::RichText::new(marker)
+                                .font(adapt::font_micro())
+                                .color(c(color::BLUE_300)),
+                        )
+                        .on_hover_text(detail);
                     }
-                    ui.label(
-                        egui::RichText::new(concat!("v", env!("CARGO_PKG_VERSION")))
-                            .font(adapt::font_micro())
-                            .color(c(color::BLUE_300)),
-                    );
                 });
             });
     }
@@ -459,20 +550,25 @@ impl EluSiveApp {
 
                 match view.section {
                     Section::Overview => overview(ui, run, view, t),
-                    Section::Chromatograms | Section::Peaks | Section::Integration => {
+                    Section::Chromatograms | Section::Peaks => {
                         if let Some(action) = linked_pane(ui, run, view, t) {
                             let ctx = ui.ctx().clone();
                             self.handle(&ctx, action);
                         }
                     }
                     Section::Calibration => {
-                        adapt::card(t).show(ui, |ui| {
-                            egui::ScrollArea::vertical()
-                                .id_salt("calibration-scroll")
-                                .show(ui, |ui| {
-                                    panels::calibration_panel(ui, run, view, t);
+                        // The scroll area owns the vertical axis; the card sits
+                        // inside it so it hugs its content instead of stretching
+                        // to the viewport on both axes.
+                        egui::ScrollArea::vertical()
+                            .id_salt("calibration-scroll")
+                            .show(ui, |ui| {
+                                measured_form(ui, |ui| {
+                                    adapt::card(t).show(ui, |ui| {
+                                        panels::calibration_panel(ui, run, view, t);
+                                    });
                                 });
-                        });
+                            });
                     }
                     Section::Results => {
                         adapt::card(t).show(ui, |ui| {
@@ -487,6 +583,52 @@ impl EluSiveApp {
                 }
             });
     }
+}
+
+/// Navigation rail geometry for one frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct NavLayout {
+    width: f32,
+    /// Whether section names fit beside the icons at this width.
+    labels: bool,
+}
+
+/// Interpolate the rail between its two widths.
+///
+/// `t` is the animation position from `Context::animate_bool_with_time`: 0 is
+/// fully collapsed, 1 fully expanded. Labels are switched on the *animated*
+/// width rather than on `View::nav_collapsed`, because a name is only worth
+/// drawing once there is room for it — keying off the flag instead leaves the
+/// captions wrapping inside a rail that is mid-slide and far too narrow.
+///
+/// Split out as a pure function so the behaviour is checkable in CI, which has
+/// no window to open.
+fn nav_layout(t: f32) -> NavLayout {
+    let width = egui::emath::lerp(NAV_WIDTH_COLLAPSED..=NAV_WIDTH_EXPANDED, t.clamp(0.0, 1.0));
+    NavLayout {
+        width,
+        labels: width >= (NAV_WIDTH_COLLAPSED + NAV_WIDTH_EXPANDED) / 2.0,
+    }
+}
+
+/// The collapsed rail's footer: a marker narrow enough to fit, and the text its
+/// tooltip carries.
+///
+/// The version has to stay reachable — it is the first thing a bug report needs
+/// — but `v0.10.0` at 11 px does not fit the ~32 px of content a 56 px rail
+/// leaves, and a half-drawn version number is worse than none. A missing font is
+/// a status, so rule #3 applies here too: the marker changes *shape* when the
+/// warning is live rather than hiding entirely behind the hover.
+fn nav_footer(missing_fonts: &[String]) -> (&'static str, String) {
+    let mut detail = concat!("EluSive v", env!("CARGO_PKG_VERSION")).to_string();
+    if missing_fonts.is_empty() {
+        return ("v", detail);
+    }
+    detail.push_str(&format!(
+        "\nUsing fallback fonts ({})",
+        missing_fonts.join(", ")
+    ));
+    ("v!", detail)
 }
 
 /// Estimated molecular weight for a peak, or `None` when the question does not
@@ -539,32 +681,42 @@ fn mark(ui: &mut egui::Ui, t: Theme) {
     painter.add(egui::Shape::line(points, stroke));
 }
 
+/// Run `contents` in a column no wider than a comfortable reading measure,
+/// centred in whatever the parent offers.
+///
+/// Only the width is constrained. The inner column's *height* is never measured
+/// back out to the caller, so this cannot start the auto-bounds feedback loop
+/// that `widgets::chromatogram::data_y_range` documents.
+fn measured_form<R>(ui: &mut egui::Ui, contents: impl FnOnce(&mut egui::Ui) -> R) -> Option<R> {
+    let available = ui.available_width();
+    let width = measure::content_width(available);
+    if width <= 0.0 {
+        return None;
+    }
+    let pad = measure::leading_pad(available);
+    let inner = ui
+        .horizontal(|ui| {
+            ui.add_space(pad);
+            ui.allocate_ui_with_layout(
+                egui::vec2(width, 0.0),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    // Otherwise the column collapses onto its widest child and
+                    // the card's right edge wanders with the content.
+                    ui.set_min_width(width);
+                    contents(ui)
+                },
+            )
+            .inner
+        })
+        .inner;
+    Some(inner)
+}
+
+/// The Overview cards. Their arrangement — how many columns, and in what order —
+/// lives in [`crate::widgets::overview`], which owns the width arithmetic.
 fn overview(ui: &mut egui::Ui, run: &Run, view: &mut View, t: Theme) {
-    egui::ScrollArea::vertical()
-        .id_salt("overview-scroll")
-        .show(ui, |ui| {
-            adapt::card(t).show(ui, |ui| {
-                panels::run_summary(ui, run, t);
-            });
-            ui.add_space(spacing::LG);
-
-            if !run.warnings.is_empty() {
-                adapt::card(t).show(ui, |ui| {
-                    panels::warnings(ui, run, t);
-                });
-                ui.add_space(spacing::LG);
-            }
-
-            adapt::card(t).show(ui, |ui| {
-                panels::channel_table(ui, run, t);
-            });
-            ui.add_space(spacing::LG);
-
-            adapt::card(t).show(ui, |ui| {
-                panels::heading(ui, t, "Fractions");
-                panels::fraction_table(ui, run, view, t);
-            });
-        });
+    widgets::overview::show(ui, run, view, t);
 }
 
 /// The single linked pane: chromatogram above, plate below, detail rail right.
@@ -651,7 +803,7 @@ fn linked_pane(ui: &mut egui::Ui, run: &Run, view: &mut View, t: Theme) -> Optio
         });
 
     // Peak table under the chart when the user is working on peaks.
-    if matches!(view.section, Section::Peaks | Section::Integration) {
+    if view.section == Section::Peaks {
         egui::Panel::bottom("peak-pane")
             .resizable(true)
             .default_size(180.0)
@@ -724,7 +876,8 @@ fn reports(ui: &mut egui::Ui, run: &Run, view: &mut View, t: Theme) {
         ui.label(
             egui::RichText::new(
                 "Exports are plain CSV with a fixed column order, so they drop straight into a \
-                 notebook or a script.",
+                 notebook or a script. The same peak table copies to the clipboard as Markdown \
+                 for pasting into an electronic lab notebook.",
             )
             .color(c(t.text_secondary)),
         );
@@ -737,25 +890,22 @@ fn reports(ui: &mut egui::Ui, run: &Run, view: &mut View, t: Theme) {
             if ui.button("Plate metrics (CSV)").clicked() {
                 ui.data_mut(|d| d.insert_temp(egui::Id::new("export"), 1u8));
             }
+            // Unlike the file exports this needs nothing from `self`, so it can
+            // run inline instead of going through the deferred-export channel.
+            let copy = ui.add_enabled(
+                !view.peaks.is_empty(),
+                egui::Button::new("Copy as Markdown"),
+            );
+            if copy.clicked() {
+                ui.ctx().copy_text(sidecar::peaks_to_markdown(&view.peaks));
+                // Confirming it happened does need `self`, so that part defers.
+                ui.data_mut(|d| d.insert_temp(egui::Id::new("export"), 2u8));
+            }
         });
 
         ui.add_space(spacing::LG);
         panels::heading(ui, t, "Peak table preview");
-        let csv = sidecar::peaks_to_csv(&view.peaks);
-        egui::ScrollArea::both()
-            .id_salt("csv-preview")
-            .max_height(200.0)
-            .show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new(if csv.lines().count() > 1 {
-                        csv
-                    } else {
-                        "No integrations to export yet.".to_string()
-                    })
-                    .font(adapt::font_code())
-                    .color(c(t.text_secondary)),
-                );
-            });
+        panels::peak_export_preview(ui, view, t);
 
         ui.add_space(spacing::LG);
         panels::heading(ui, t, "Sidecar");
@@ -826,6 +976,7 @@ impl eframe::App for EluSiveApp {
         match pending {
             Some(0) => self.export(ctx, ExportKind::Peaks),
             Some(1) => self.export(ctx, ExportKind::Wells),
+            Some(2) => self.note(ctx, "Peak table copied as Markdown."),
             _ => {}
         }
     }
@@ -840,6 +991,88 @@ mod tests {
         for section in Section::ALL {
             assert!(!section.label().is_empty());
         }
+    }
+
+    #[test]
+    fn every_section_has_an_icon() {
+        for section in Section::ALL {
+            assert!(!section.icon().is_empty(), "{}", section.label());
+        }
+    }
+
+    #[test]
+    fn section_icons_are_distinguishable_from_each_other() {
+        // A collapsed rail shows nothing but these, so a duplicate would leave
+        // two sections indistinguishable until the user hovers each one.
+        for (i, a) in Section::ALL.iter().enumerate() {
+            for b in &Section::ALL[i + 1..] {
+                assert_ne!(a.icon(), b.icon(), "{} and {}", a.label(), b.label());
+            }
+        }
+    }
+
+    /// The rail's glyphs must exist in the fonts the app actually ships with.
+    ///
+    /// Inter and JetBrains Mono are not vendored, so `install_fonts` normally
+    /// falls back to egui's bundled faces — and a glyph they lack renders as an
+    /// empty box, which for an icon-only rail means an unusable control. This
+    /// runs headlessly: an `egui::Context` needs no window to lay out text.
+    #[test]
+    fn nav_icons_render_in_the_bundled_fonts() {
+        let ctx = egui::Context::default();
+        adapt::install_fonts(&ctx);
+        let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+
+        let font = adapt::font_h1();
+        ctx.fonts_mut(|fonts| {
+            for glyph in [NAV_COLLAPSE_GLYPH, NAV_EXPAND_GLYPH] {
+                assert!(fonts.has_glyphs(&font, glyph), "toggle glyph {glyph:?}");
+            }
+            for section in Section::ALL {
+                assert!(
+                    fonts.has_glyphs(&font, section.icon()),
+                    "{} icon {:?}",
+                    section.label(),
+                    section.icon()
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn the_rail_slides_between_its_two_named_widths() {
+        assert_eq!(nav_layout(0.0).width, NAV_WIDTH_COLLAPSED);
+        assert_eq!(nav_layout(1.0).width, NAV_WIDTH_EXPANDED);
+        // Out-of-range animation values must not produce a negative-width panel.
+        assert_eq!(nav_layout(-0.5).width, NAV_WIDTH_COLLAPSED);
+        assert_eq!(nav_layout(2.0).width, NAV_WIDTH_EXPANDED);
+        let mid = nav_layout(0.5).width;
+        assert!(mid > NAV_WIDTH_COLLAPSED && mid < NAV_WIDTH_EXPANDED);
+    }
+
+    #[test]
+    fn labels_appear_only_once_the_rail_is_wide_enough_for_them() {
+        assert!(!nav_layout(0.0).labels);
+        assert!(nav_layout(1.0).labels);
+        // Monotonic: names must not flicker on and off part-way through a slide.
+        let mut seen_labels = false;
+        for step in 0..=40 {
+            let labels = nav_layout(step as f32 / 40.0).labels;
+            assert!(labels || !seen_labels, "labels turned back off at {step}");
+            seen_labels |= labels;
+        }
+    }
+
+    #[test]
+    fn the_collapsed_footer_keeps_the_version_and_flags_fallback_fonts() {
+        let (marker, detail) = nav_footer(&[]);
+        assert_eq!(marker, "v");
+        assert!(detail.contains(env!("CARGO_PKG_VERSION")));
+
+        let (marker, detail) = nav_footer(&["Inter".to_string()]);
+        assert_ne!(marker, "v", "a live warning must change the marker's shape");
+        assert!(detail.contains(env!("CARGO_PKG_VERSION")));
+        assert!(detail.contains("Inter"));
     }
 
     #[test]

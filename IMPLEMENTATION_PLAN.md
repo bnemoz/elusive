@@ -348,7 +348,9 @@ Required implementation details:
 Default CSV export targets:
 
 - peak table:
-  `peak_id,channel_id,v_start_ml,v_end_ml,apex_volume_ml,area,height,fwhm,estimated_mw`
+  `peak_id,channel_id,v_start_ml,v_end_ml,apex_volume_ml,area,height,fwhm,estimated_mw,fractions`
+  (`fractions` is the quoted, comma-separated list of wells the peak's window
+  overlaps, in collection order; empty when the source format carries none)
 - well table:
   `well_id,row,col,channel_id,metric,value`
 

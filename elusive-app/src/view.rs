@@ -12,9 +12,9 @@
 
 use elusive_core::calibration::{Calibration, CalibrationPoint, Extinction};
 use elusive_core::integrate::PlateMetric;
-use elusive_core::model::{BaselineMode, ChannelId, PeakId, PeakResult, Run, Well};
+use elusive_core::model::{BaselineMode, ChannelId, Color, PeakId, PeakResult, Run, Well};
 use elusive_core::sidecar::{Annotation, ExcludedRegion, NamedCalibration, Sidecar, ViewState};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Something the user did in a widget that the app must act on.
 #[derive(Clone, Debug, PartialEq)]
@@ -29,18 +29,16 @@ pub enum Section {
     Overview,
     Chromatograms,
     Peaks,
-    Integration,
     Calibration,
     Results,
     Reports,
 }
 
 impl Section {
-    pub const ALL: [Section; 7] = [
+    pub const ALL: [Section; 6] = [
         Section::Overview,
         Section::Chromatograms,
         Section::Peaks,
-        Section::Integration,
         Section::Calibration,
         Section::Results,
         Section::Reports,
@@ -51,12 +49,110 @@ impl Section {
             Section::Overview => "Overview",
             Section::Chromatograms => "Chromatograms",
             Section::Peaks => "Peaks",
-            Section::Integration => "Integration",
             Section::Calibration => "Calibration",
             Section::Results => "Results",
             Section::Reports => "Reports",
         }
     }
+
+    /// A single glyph standing in for the section when the rail is collapsed.
+    ///
+    /// Deliberately drawn from a narrow set of characters: Inter and JetBrains
+    /// Mono are not vendored (`assets/fonts/README.md`), so on most machines
+    /// these render through egui's bundled fallback faces, where anything
+    /// exotic comes out as tofu. `nav_icons_render_in_the_bundled_fonts` in
+    /// `app.rs` checks the actual glyph coverage rather than trusting the
+    /// choice. An icon never travels alone — the collapsed rail pairs it with a
+    /// hover tooltip carrying [`Section::label`], because a control identified
+    /// only by its appearance is the failure rule #3 exists to prevent.
+    pub fn icon(self) -> &'static str {
+        match self {
+            Section::Overview => "☰",
+            Section::Chromatograms => "🗠",
+            Section::Peaks => "Λ",
+            Section::Calibration => "⚖",
+            Section::Results => "∑",
+            Section::Reports => "🖹",
+        }
+    }
+}
+
+/// A card in the Overview section, in the order the user has arranged them.
+///
+/// The Overview is the one section whose layout the user controls, so its cards
+/// need names that survive a restart. The variants are UI identity only — the
+/// core knows nothing about them, and the sidecar stores [`PanelId::as_str`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PanelId {
+    RunSummary,
+    Warnings,
+    Channels,
+    Fractions,
+}
+
+impl PanelId {
+    /// The declared default arrangement, and the order a reset returns to.
+    pub const ALL: [PanelId; 4] = [
+        PanelId::RunSummary,
+        PanelId::Warnings,
+        PanelId::Channels,
+        PanelId::Fractions,
+    ];
+
+    /// Stable serialized form. Never rename one of these without a migration:
+    /// an id this build does not recognise is dropped on load.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PanelId::RunSummary => "run_summary",
+            PanelId::Warnings => "warnings",
+            PanelId::Channels => "channels",
+            PanelId::Fractions => "fractions",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        PanelId::ALL.into_iter().find(|p| p.as_str() == s)
+    }
+}
+
+/// Move the panel at `from` to index `to`, shifting everything between.
+///
+/// Pure, because the drag-and-drop gesture that calls it cannot be exercised in
+/// a headless test but this arithmetic can. Out-of-range indices are ignored
+/// rather than clamped: a drop that does not name a real slot is not a reorder.
+/// Returns whether the order actually changed.
+pub fn reorder(order: &mut Vec<PanelId>, from: usize, to: usize) -> bool {
+    if from >= order.len() || to >= order.len() || from == to {
+        return false;
+    }
+    let panel = order.remove(from);
+    order.insert(to, panel);
+    true
+}
+
+/// Rebuild a panel order from the strings in a sidecar.
+///
+/// Tolerant in both directions on purpose. An id this build does not know is
+/// dropped (a sidecar from a future version with an extra card), and any panel
+/// the saved list never mentions is appended after the ones it does mention (a
+/// sidecar from an older version, or one that lost an id). Either way every panel
+/// this build can draw appears exactly once, so a stale file can never hide a
+/// card the user would then have no way to get back.
+pub fn restore_order(saved: &[String]) -> Vec<PanelId> {
+    let mut order: Vec<PanelId> = Vec::with_capacity(PanelId::ALL.len());
+    for id in saved {
+        if let Some(panel) = PanelId::parse(id) {
+            if !order.contains(&panel) {
+                order.push(panel);
+            }
+        }
+    }
+    for panel in PanelId::ALL {
+        if !order.contains(&panel) {
+            order.push(panel);
+        }
+    }
+    order
 }
 
 /// Which baseline the next integration will use.
@@ -139,12 +235,22 @@ impl ConcentrationInputs {
 #[derive(Clone, Debug)]
 pub struct View {
     pub section: Section,
+    /// Navigation rail reduced to icons only.
+    pub nav_collapsed: bool,
 
     // --- channel display ---
     pub hidden_channels: BTreeSet<ChannelId>,
     pub selected_channel: Option<ChannelId>,
     pub hero_channel_id: Option<ChannelId>,
     pub show_fractions: bool,
+    /// Trace colours the user picked from the legend, overriding every automatic
+    /// choice. Stored as the core [`Color`] rather than a `theme::Rgb` so the
+    /// override and the ChromLab legend colour it replaces share one
+    /// representation, and the sidecar gains no second colour encoding.
+    pub channel_colors: BTreeMap<ChannelId, Color>,
+
+    /// Overview card order, left-to-right then top-to-bottom through the columns.
+    pub overview_order: Vec<PanelId>,
 
     // --- linked hover state (Phase 4) ---
     pub hovered_vol_range: Option<(f32, f32)>,
@@ -186,10 +292,13 @@ impl Default for View {
     fn default() -> Self {
         Self {
             section: Section::Overview,
+            nav_collapsed: false,
             hidden_channels: BTreeSet::new(),
             selected_channel: None,
             hero_channel_id: None,
             show_fractions: true,
+            overview_order: PanelId::ALL.to_vec(),
+            channel_colors: BTreeMap::new(),
             hovered_vol_range: None,
             hovered_well: None,
             hovered_volume: None,
@@ -221,6 +330,7 @@ impl View {
     /// Reset per-run state and adopt sensible defaults for a freshly opened run.
     pub fn adopt_run(&mut self, run: &Run) {
         self.hidden_channels.clear();
+        self.channel_colors.clear();
         self.peaks.clear();
         self.excluded_regions.clear();
         self.annotations.clear();
@@ -233,6 +343,9 @@ impl View {
         self.hovered_well = None;
         self.next_peak_id = 1;
         self.dirty = false;
+        // `overview_order` is deliberately not reset: the arrangement is a
+        // working preference, not a property of the run, so it survives opening
+        // the next file. A sidecar for that file may still override it.
 
         let hero = run.hero_channel().map(|c| c.id.clone());
         self.hero_channel_id = hero.clone();
@@ -282,9 +395,72 @@ impl View {
         }
     }
 
+    /// The user's chosen colour for a channel, if they set one.
+    pub fn channel_color(&self, id: &ChannelId) -> Option<Color> {
+        self.channel_colors.get(id).copied()
+    }
+
+    /// Override a channel's trace colour.
+    ///
+    /// Forced opaque: a trace is a line, not a fill, and a semi-transparent line
+    /// over a fraction zone reads as a different colour than the legend swatch.
+    pub fn set_channel_color(&mut self, id: &ChannelId, color: Color) {
+        let color = Color::new(color.r, color.g, color.b, 0xFF);
+        if self.channel_colors.insert(id.clone(), color) != Some(color) {
+            self.dirty = true;
+        }
+    }
+
+    /// Drop an override so the channel falls back to the automatic colour.
+    pub fn clear_channel_color(&mut self, id: &ChannelId) {
+        if self.channel_colors.remove(id).is_some() {
+            self.dirty = true;
+        }
+    }
+
     pub fn set_show_fractions(&mut self, show: bool) {
         if self.show_fractions != show {
             self.show_fractions = show;
+            self.dirty = true;
+        }
+    }
+
+    /// Collapse or expand the navigation rail.
+    ///
+    /// Marked dirty like the other saved display preferences: the rail state
+    /// rides in the sidecar because `persist_egui_memory` is off, so an unsaved
+    /// toggle really would be lost on the next launch.
+    pub fn set_nav_collapsed(&mut self, collapsed: bool) {
+        if self.nav_collapsed != collapsed {
+            self.nav_collapsed = collapsed;
+            self.dirty = true;
+        }
+    }
+
+    /// Drop the panel `dragged` into the slot `target` currently occupies.
+    ///
+    /// Takes panels rather than indices because the drag payload is a panel and
+    /// the visible list may omit the Warnings card; resolving against
+    /// `overview_order` here keeps the hidden card's saved position intact.
+    pub fn move_overview_panel(&mut self, dragged: PanelId, target: PanelId) {
+        let (Some(from), Some(to)) = (
+            self.overview_order.iter().position(|p| *p == dragged),
+            self.overview_order.iter().position(|p| *p == target),
+        ) else {
+            return;
+        };
+        if reorder(&mut self.overview_order, from, to) {
+            self.dirty = true;
+        }
+    }
+
+    pub fn overview_order_is_default(&self) -> bool {
+        self.overview_order == PanelId::ALL
+    }
+
+    pub fn reset_overview_order(&mut self) {
+        if !self.overview_order_is_default() {
+            self.overview_order = PanelId::ALL.to_vec();
             self.dirty = true;
         }
     }
@@ -388,6 +564,19 @@ impl View {
             plate_metric: Some(self.plate_metric),
             show_fractions: Some(self.show_fractions),
             plate_uniform_ramp: Some(self.plate_uniform_ramp),
+            nav_collapsed: Some(self.nav_collapsed),
+            overview_order: Some(
+                self.overview_order
+                    .iter()
+                    .map(|p| p.as_str().to_string())
+                    .collect(),
+            ),
+            channel_colors: Some(
+                self.channel_colors
+                    .iter()
+                    .map(|(id, color)| (id.0.clone(), *color))
+                    .collect(),
+            ),
         };
         sidecar
     }
@@ -458,6 +647,22 @@ impl View {
         }
         if let Some(enabled) = sidecar.view.plate_uniform_ramp {
             self.plate_uniform_ramp = enabled;
+        }
+        if let Some(collapsed) = sidecar.view.nav_collapsed {
+            self.nav_collapsed = collapsed;
+        }
+        if let Some(saved) = &sidecar.view.overview_order {
+            self.overview_order = restore_order(saved);
+        }
+        if let Some(colors) = &sidecar.view.channel_colors {
+            // An override for a channel this run lacks is dropped without a note.
+            // Unlike an orphaned peak it carries no measurement, so warning about
+            // it would be noise on every reopen of a re-exported run.
+            self.channel_colors = colors
+                .iter()
+                .filter(|(id, _)| run.channels.iter().any(|c| c.id.0 == **id))
+                .map(|(id, color)| (ChannelId(id.clone()), *color))
+                .collect();
         }
 
         self.dirty = false;
@@ -548,6 +753,11 @@ mod tests {
         view.set_plate_metric(PlateMetric::MaxValue);
         view.set_show_fractions(false);
         view.set_plate_uniform_ramp(true);
+        view.set_nav_collapsed(true);
+        view.set_channel_color(
+            &ChannelId::from("MWave2"),
+            Color::new(0xC4, 0x77, 0x3D, 0xFF),
+        );
         let peak_id = view.allocate_peak_id();
         view.add_peak(PeakResult {
             id: peak_id,
@@ -571,7 +781,73 @@ mod tests {
         assert_eq!(restored.plate_metric, PlateMetric::MaxValue);
         assert!(!restored.show_fractions);
         assert!(restored.plate_uniform_ramp);
+        assert!(restored.nav_collapsed);
+        assert_eq!(
+            restored.channel_color(&ChannelId::from("MWave2")),
+            Some(Color::new(0xC4, 0x77, 0x3D, 0xFF))
+        );
         assert!(!restored.dirty, "a freshly loaded sidecar is not dirty");
+    }
+
+    #[test]
+    fn a_sidecar_written_before_the_rail_existed_leaves_it_alone() {
+        // `nav_collapsed` is optional precisely so an older file does not force
+        // the rail open on someone who collapsed it.
+        let run = test_run();
+        let mut view = View::default();
+        view.set_nav_collapsed(true);
+        let mut sidecar = Sidecar::for_run(&run);
+        sidecar.view.nav_collapsed = None;
+        view.apply_sidecar(&sidecar, &run);
+        assert!(view.nav_collapsed);
+    }
+
+    #[test]
+    fn a_sidecar_written_before_colour_overrides_existed_still_loads() {
+        // `channel_colors: None` is what an older file deserializes to (the
+        // wire-format half of this is checked in `elusive-core`'s sidecar tests).
+        let run = test_run();
+        let mut sidecar = Sidecar::for_run(&run);
+        sidecar.view.channel_colors = None;
+
+        let mut view = View::default();
+        view.adopt_run(&run);
+        view.set_channel_color(&ChannelId::from("MWave2"), Color::new(1, 2, 3, 0xFF));
+        view.apply_sidecar(&sidecar, &run);
+        assert_eq!(
+            view.channel_color(&ChannelId::from("MWave2")),
+            Some(Color::new(1, 2, 3, 0xFF)),
+            "a sidecar with no opinion must not silently clear the session's colours"
+        );
+    }
+
+    #[test]
+    fn a_colour_override_is_stored_opaque_and_marks_the_view_dirty() {
+        let mut view = View::default();
+        let id = ChannelId::from("MWave2");
+        assert!(!view.dirty);
+
+        // Traces are lines, not fills; the stored alpha is always 0xFF.
+        view.set_channel_color(&id, Color::new(0x2E, 0x95, 0x99, 0x40));
+        assert_eq!(
+            view.channel_color(&id),
+            Some(Color::new(0x2E, 0x95, 0x99, 0xFF))
+        );
+        assert!(view.dirty);
+
+        // Re-picking the same colour is not a change worth re-saving for.
+        view.dirty = false;
+        view.set_channel_color(&id, Color::new(0x2E, 0x95, 0x99, 0xFF));
+        assert!(!view.dirty);
+
+        view.clear_channel_color(&id);
+        assert_eq!(view.channel_color(&id), None);
+        assert!(view.dirty);
+
+        // Clearing an override that was never set is likewise a no-op.
+        view.dirty = false;
+        view.clear_channel_color(&id);
+        assert!(!view.dirty);
     }
 
     #[test]
@@ -617,6 +893,117 @@ mod tests {
         let mut view = View::default();
         view.apply_sidecar(&sidecar, &run);
         assert_eq!(view.allocate_peak_id(), PeakId(10));
+    }
+
+    #[test]
+    fn moving_a_panel_forward_and_backward_shifts_the_rest() {
+        let mut order = PanelId::ALL.to_vec();
+        assert!(reorder(&mut order, 0, 2));
+        assert_eq!(
+            order,
+            vec![
+                PanelId::Warnings,
+                PanelId::Channels,
+                PanelId::RunSummary,
+                PanelId::Fractions
+            ]
+        );
+        assert!(reorder(&mut order, 3, 1));
+        assert_eq!(
+            order,
+            vec![
+                PanelId::Warnings,
+                PanelId::Fractions,
+                PanelId::Channels,
+                PanelId::RunSummary
+            ]
+        );
+    }
+
+    #[test]
+    fn dropping_a_panel_on_itself_or_off_the_end_is_not_a_reorder() {
+        let mut order = PanelId::ALL.to_vec();
+        assert!(!reorder(&mut order, 2, 2));
+        assert!(!reorder(&mut order, 0, 9));
+        assert!(!reorder(&mut order, 9, 0));
+        assert_eq!(order, PanelId::ALL.to_vec());
+    }
+
+    #[test]
+    fn a_reorder_marks_the_analysis_dirty() {
+        let mut view = View::default();
+        view.move_overview_panel(PanelId::Fractions, PanelId::RunSummary);
+        assert_eq!(view.overview_order.first(), Some(&PanelId::Fractions));
+        assert!(view.dirty);
+
+        view.dirty = false;
+        view.reset_overview_order();
+        assert!(view.overview_order_is_default());
+        assert!(view.dirty);
+    }
+
+    #[test]
+    fn an_unknown_saved_panel_id_is_dropped_rather_than_shown() {
+        let order = restore_order(&[
+            "fractions".to_string(),
+            "spectra_from_a_future_build".to_string(),
+            "run_summary".to_string(),
+        ]);
+        assert_eq!(order[0], PanelId::Fractions);
+        assert_eq!(order[1], PanelId::RunSummary);
+        assert_eq!(order.len(), PanelId::ALL.len());
+    }
+
+    #[test]
+    fn a_panel_missing_from_the_saved_order_is_still_shown() {
+        let order = restore_order(&["channels".to_string(), "channels".to_string()]);
+        assert_eq!(order[0], PanelId::Channels);
+        let mut sorted = order.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), PanelId::ALL.len(), "every panel appears once");
+    }
+
+    #[test]
+    fn sidecar_round_trip_restores_the_overview_arrangement() {
+        let run = test_run();
+        let mut view = View::default();
+        view.adopt_run(&run);
+        view.move_overview_panel(PanelId::Fractions, PanelId::RunSummary);
+        let arranged = view.overview_order.clone();
+        let sidecar = view.to_sidecar(&run);
+        assert_eq!(
+            sidecar.view.overview_order.as_deref(),
+            Some(
+                arranged
+                    .iter()
+                    .map(|p| p.as_str().to_string())
+                    .collect::<Vec<_>>()
+                    .as_slice()
+            ),
+            "the sidecar stores the stable string form"
+        );
+
+        let mut restored = View::default();
+        restored.apply_sidecar(&sidecar, &run);
+        assert_eq!(restored.overview_order, arranged);
+        assert!(!restored.dirty);
+    }
+
+    #[test]
+    fn a_sidecar_without_an_overview_order_keeps_the_default() {
+        let run = test_run();
+        let sidecar = Sidecar::for_run(&run);
+        assert!(sidecar.view.overview_order.is_none());
+
+        let mut view = View::default();
+        view.move_overview_panel(PanelId::Channels, PanelId::RunSummary);
+        view.apply_sidecar(&sidecar, &run);
+        assert_eq!(
+            view.overview_order.first(),
+            Some(&PanelId::Channels),
+            "an older sidecar says nothing about the order, so it must not clear it"
+        );
     }
 
     #[test]
