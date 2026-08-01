@@ -351,7 +351,7 @@ impl EluSiveApp {
                                 }
                             });
                         let mut show_fractions = self.view.show_fractions;
-                        if ui.checkbox(&mut show_fractions, "Fraction ticks").changed() {
+                        if ui.checkbox(&mut show_fractions, "Fraction zones").changed() {
                             self.view.set_show_fractions(show_fractions);
                         }
                     });
@@ -574,9 +574,11 @@ fn linked_pane(ui: &mut egui::Ui, run: &Run, view: &mut View, t: Theme) -> Optio
 
     egui::Panel::right("detail-rail")
         .resizable(true)
-        .default_width(340.0)
-        .min_width(260.0)
-        .max_width(640.0)
+        // egui 0.35 merged SidePanel and TopBottomPanel into one `Panel`, so the
+        // sizing builders are axis-neutral: `default_size`/`size_range`, not
+        // `default_width`/`min_width`/`max_width`.
+        .default_size(340.0)
+        .size_range(egui::Rangef::new(260.0, 640.0))
         .frame(adapt::card(t))
         .show(ui, |ui| {
             egui::ScrollArea::vertical()

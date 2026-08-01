@@ -147,11 +147,23 @@ possible; the one new token group (`plate`) is named and purpose-documented per 
   derived from the calibration curve; concentration is a separate A280 field.
 
 ### 10.2 Fraction bands (on the trace)
-- Fraction boundaries: 1 px vertical ticks in `SLATE_500` at the baseline; do not
-  span full height (rule #2 — raw trace stays dominant).
+- Fraction windows: full-height zones filled at very low alpha (≈18/255, with
+  alternating fractions a few steps apart so adjacent windows are separable), plus
+  a hairline boundary stroke.
+
+  *Revised in 0.2.0.* This previously specified 1 px ticks at the baseline, on the
+  grounds that a full-height band would compete with the trace. In use the ticks
+  turned out to be worse: they sit at the baseline, so they leave the viewport as
+  soon as the user pans or zooms vertically, and the fraction windows — the thing
+  the plate view is keyed to — become invisible exactly when someone is inspecting
+  a peak closely. A zone faint enough to read *through* satisfies rule #2 while
+  staying anchored to the data rather than to the viewport.
 - Collected span fill (when a fraction is highlighted): `ICE_100` at low alpha on
   light, `INK_800` on dark. Hovered/selected fraction boundary: `BLUE_600` stroke.
 - Fraction id badges use the Small/Micro type ramp; never place long labels on-plot.
+- Zones are drawn from the **data's** y-extent, never from the plot's current
+  bounds. An overlay sized from the current bounds re-enters the next frame's
+  auto-bounds and inflates the scale on every repaint (see `chromatogram.rs`).
 
 ### 10.3 96-well plate heatmap
 Wells are colored by a live-selected channel + metric (integrated area / max / mean /
