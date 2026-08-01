@@ -183,7 +183,7 @@ impl EluSiveApp {
         let (default_name, contents) = match kind {
             ExportKind::Peaks => (
                 format!("{}-peaks.csv", stem(run)),
-                sidecar::peaks_to_csv(&self.view.peaks),
+                sidecar::peaks_to_csv(run, &self.view.peaks),
             ),
             ExportKind::Wells => (
                 format!("{}-wells.csv", stem(run)),

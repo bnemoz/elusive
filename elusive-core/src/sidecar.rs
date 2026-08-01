@@ -231,13 +231,20 @@ pub fn save(path: impl AsRef<Path>, sidecar: &Sidecar) -> Result<()> {
 
 /// CSV export of the peak table.
 /// Schema fixed by `IMPLEMENTATION_PLAN.md` Phase 5.
-pub fn peaks_to_csv(peaks: &[PeakResult]) -> String {
+///
+/// `fractions` lists every well the peak's window overlaps, spelled out rather
+/// than ranged so a script does not have to expand `D5–D8` itself. It is empty
+/// both when no fraction overlaps and when the source format carries no
+/// fractions at all — the two are distinguished in the UI, not here.
+pub fn peaks_to_csv(run: &Run, peaks: &[PeakResult]) -> String {
     let mut out = String::from(
-        "peak_id,channel_id,v_start_ml,v_end_ml,apex_volume_ml,area,height,fwhm,estimated_mw\n",
+        "peak_id,channel_id,v_start_ml,v_end_ml,apex_volume_ml,area,height,fwhm,estimated_mw,fractions\n",
     );
     for p in peaks {
+        let fractions =
+            crate::wells::join_well_labels(&run.wells_in_volume(p.v_start_ml, p.v_end_ml));
         out.push_str(&format!(
-            "{},{},{:.4},{:.4},{:.4},{:.6},{:.6},{},{}\n",
+            "{},{},{:.4},{:.4},{:.4},{:.6},{:.6},{},{},{}\n",
             p.id.0,
             csv_escape(p.channel_id.as_str()),
             p.v_start_ml,
@@ -249,6 +256,7 @@ pub fn peaks_to_csv(peaks: &[PeakResult]) -> String {
             p.estimated_mw_kda
                 .map(|v| format!("{v:.3}"))
                 .unwrap_or_default(),
+            csv_escape(&fractions),
         ));
     }
     out
@@ -332,7 +340,40 @@ fn csv_escape(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::calibration::{fit, CalibrationPoint, FitBasis};
-    use crate::model::{BaselineMode, ChannelId, PeakId, Well};
+    use crate::model::{BaselineMode, ChannelId, Fraction, PeakId, SourceFormat, Well};
+
+    fn sample_run(source_format: SourceFormat, fractions: Vec<Fraction>) -> Run {
+        Run {
+            meta: crate::model::RunMeta::default(),
+            source_format,
+            source_path: PathBuf::from("run.ngcAnalysis"),
+            channels: Vec::new(),
+            fractions,
+            events: Vec::new(),
+            warnings: Vec::new(),
+        }
+    }
+
+    /// A fraction occupying `[start, start + 1)` in the given well.
+    fn sample_fraction(tube: u32, start: f32, well: Well) -> Fraction {
+        Fraction {
+            tube,
+            rack: 1,
+            well: Some(well),
+            vol_start_ml: start,
+            vol_end_ml: start + 1.0,
+            time_start_s: 0.0,
+            time_end_s: 0.0,
+            nominal_size_ml: Some(1.0),
+            end_estimated: false,
+            rack_type: "HEP96".into(),
+            pattern: "Serpentine".into(),
+        }
+    }
+
+    fn fractionless_run() -> Run {
+        sample_run(SourceFormat::NgcAnalysis, Vec::new())
+    }
 
     fn sample_peak() -> PeakResult {
         PeakResult {
@@ -492,16 +533,76 @@ mod tests {
 
     #[test]
     fn peak_csv_matches_the_agreed_schema() {
-        let csv = peaks_to_csv(&[sample_peak()]);
+        let csv = peaks_to_csv(&fractionless_run(), &[sample_peak()]);
         let mut lines = csv.lines();
         assert_eq!(
             lines.next().unwrap(),
-            "peak_id,channel_id,v_start_ml,v_end_ml,apex_volume_ml,area,height,fwhm,estimated_mw"
+            "peak_id,channel_id,v_start_ml,v_end_ml,apex_volume_ml,area,height,fwhm,estimated_mw,\
+             fractions"
         );
         let row = lines.next().unwrap();
         assert!(row.starts_with("1,MWave2,12.0000,14.0000,13.0000,"));
-        // An unset MW must be an empty cell, never a zero that reads as a result.
-        assert!(row.ends_with(','), "row = {row}");
+        // An unset MW must be an empty cell, never a zero that reads as a result;
+        // with no fractions collected the last cell is empty too.
+        assert!(row.ends_with(",,"), "row = {row}");
+    }
+
+    #[test]
+    fn the_fraction_cell_is_quoted_because_it_holds_a_comma_separated_list() {
+        let run = sample_run(
+            SourceFormat::NgcAnalysis,
+            vec![
+                sample_fraction(1, 12.0, Well::new(3, 4)),
+                sample_fraction(2, 13.0, Well::new(3, 5)),
+            ],
+        );
+        let csv = peaks_to_csv(&run, &[sample_peak()]);
+        let row = csv.lines().nth(1).expect("one data row");
+        assert!(row.ends_with(",\"D5, D6\""), "row = {row}");
+
+        // Round trip: a naive split on commas outside quotes must recover the
+        // field intact, commas and all.
+        assert_eq!(unquote_last_field(row), "D5, D6");
+    }
+
+    #[test]
+    fn a_csv_import_exports_an_empty_fraction_cell_rather_than_a_guess() {
+        // `SourceFormat::AnalysisCsv` cannot carry fractions at all, so there is
+        // nothing honest to write here.
+        let run = sample_run(SourceFormat::AnalysisCsv, Vec::new());
+        assert!(!run.source_format.supports_fractions());
+        let row = peaks_to_csv(&run, &[sample_peak()])
+            .lines()
+            .nth(1)
+            .map(str::to_owned)
+            .expect("one data row");
+        assert!(row.ends_with(",,"), "row = {row}");
+    }
+
+    /// Minimal RFC-4180 reader for the final field of a row, used to prove the
+    /// quoting survives a parse rather than merely looking right.
+    fn unquote_last_field(row: &str) -> String {
+        let mut fields = vec![String::new()];
+        let mut in_quotes = false;
+        let mut chars = row.chars().peekable();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '"' if in_quotes && chars.peek() == Some(&'"') => {
+                    chars.next();
+                    if let Some(last) = fields.last_mut() {
+                        last.push('"');
+                    }
+                }
+                '"' => in_quotes = !in_quotes,
+                ',' if !in_quotes => fields.push(String::new()),
+                _ => {
+                    if let Some(last) = fields.last_mut() {
+                        last.push(ch);
+                    }
+                }
+            }
+        }
+        fields.pop().unwrap_or_default()
     }
 
     #[test]
@@ -584,6 +685,6 @@ mod tests {
     fn channel_ids_containing_commas_are_quoted() {
         let mut p = sample_peak();
         p.channel_id = ChannelId::from("UV,weird");
-        assert!(peaks_to_csv(&[p]).contains("\"UV,weird\""));
+        assert!(peaks_to_csv(&fractionless_run(), &[p]).contains("\"UV,weird\""));
     }
 }

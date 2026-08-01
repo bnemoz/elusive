@@ -10,7 +10,7 @@
 //! opens it — these synthetic ones check the logic, not the reality of the format.
 
 use base64::Engine as _;
-use elusive_core::model::{ChannelKind, SourceFormat};
+use elusive_core::model::{ChannelKind, SourceFormat, Well};
 use elusive_core::parse::ngc;
 use std::io::{Cursor, Write};
 use std::path::Path;
@@ -342,6 +342,23 @@ fn fraction_lookup_by_volume_finds_the_overlapping_tubes() {
         .map(|f| f.tube)
         .collect();
     assert_eq!(wide, vec![2, 3, 4]);
+}
+
+#[test]
+fn a_peak_window_names_the_wells_it_was_collected_into() {
+    let run = open_realistic();
+    // Tubes are 0.4 mL from 10.0 mL, so 11.3..12.7 covers t4 (11.2..11.6) through
+    // t7 (12.4..12.8). Tube 3 ends exactly at 11.2 and caught none of it.
+    let wells = run.wells_in_volume(11.3, 12.7);
+    assert_eq!(
+        wells.iter().map(Well::label).collect::<Vec<_>>(),
+        ["A4", "A5", "A6", "A7"]
+    );
+    // Straight into a table cell, ranged because the row is contiguous.
+    assert_eq!(
+        elusive_core::wells::format_well_list(&wells, Some(4)),
+        "A4–A7"
+    );
 }
 
 #[test]
