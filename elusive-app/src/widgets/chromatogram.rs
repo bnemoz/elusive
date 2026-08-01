@@ -10,7 +10,7 @@ use crate::theme::{chart, color, stroke, Theme};
 use crate::view::{Interaction, View};
 use egui::Ui;
 use egui_plot::{Line, Plot, PlotPoints, Polygon};
-use elusive_core::model::{AxisGroup, Channel, Run};
+use elusive_core::model::{AxisGroup, Channel, Fraction, PeakId, PeakResult, Run};
 
 /// Fraction of the pane's height given to the hero (UV) group.
 const HERO_HEIGHT_SHARE: f32 = 0.55;
@@ -138,6 +138,89 @@ fn data_y_range(channels: &[(usize, &Channel)]) -> (f64, f64) {
     (lo, hi)
 }
 
+/// The peak facts the hover readout needs, lifted out of [`View`].
+///
+/// `label_formatter` holds its closure for as long as the `Plot` lives, which
+/// spans the `show` body that mutates `View`. Copying three `Copy` fields per
+/// peak up front settles that overlap without interior mutability.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct HoverPeak {
+    id: PeakId,
+    v_start_ml: f32,
+    v_end_ml: f32,
+}
+
+impl HoverPeak {
+    /// Peak windows arrive from a drag, so do not assume start precedes end.
+    fn covers(&self, x: f64) -> bool {
+        let (a, b) = if self.v_start_ml <= self.v_end_ml {
+            (self.v_start_ml, self.v_end_ml)
+        } else {
+            (self.v_end_ml, self.v_start_ml)
+        };
+        a as f64 <= x && x <= b as f64
+    }
+}
+
+/// The peaks that belong on one axis group's plot.
+///
+/// Same filter as `draw_peak_regions`: a conductivity peak must not be named
+/// while the pointer is over the UV plot, where its window means nothing.
+fn hover_peaks(run: &Run, peaks: &[PeakResult], group: AxisGroup) -> Vec<HoverPeak> {
+    peaks
+        .iter()
+        .filter(|p| {
+            run.channel(&p.channel_id)
+                .is_some_and(|c| c.kind.axis_group() == group)
+        })
+        .map(|p| HoverPeak {
+            id: p.id,
+            v_start_ml: p.v_start_ml,
+            v_end_ml: p.v_end_ml,
+        })
+        .collect()
+}
+
+/// The collected fraction covering `x`, if any.
+///
+/// Takes the first hit rather than asserting uniqueness: a malformed run can
+/// report overlapping windows, and a tooltip is not the place to discover that.
+/// `run.fractions` is not assumed sorted, so this is a scan.
+fn fraction_at(run: &Run, x: f64) -> Option<&Fraction> {
+    run.fractions.iter().find(|f| {
+        let (a, b) = f.volume_window();
+        f.has_usable_window() && a as f64 <= x && x <= b as f64
+    })
+}
+
+/// The hover readout under the cursor.
+///
+/// Volume and value alone leave the user cross-referencing the plate and the peak
+/// table by eye to answer "which tube is this, and did I integrate it?". The
+/// fraction and peak lines are omitted when they do not apply — a placeholder line
+/// is noise the eye still has to parse.
+fn hover_label(run: &Run, peaks: &[HoverPeak], unit: &str, x: f64, y: f64) -> String {
+    let mut out = format!("{} mL\n{}", adapt::num(x, 3), adapt::num(y, 3));
+    if !unit.is_empty() {
+        out.push(' ');
+        out.push_str(unit);
+    }
+    if let Some(f) = fraction_at(run, x) {
+        // Fall back to the tube number when the rack mapping is unresolved:
+        // `well` is `None` for rack types the parser cannot lay out.
+        let which = f
+            .well
+            .map(|w| w.label())
+            .unwrap_or_else(|| format!("tube {}", f.tube));
+        out.push_str(&format!("\nFraction {which}"));
+    }
+    if let Some(p) = peaks.iter().find(|p| p.covers(x)) {
+        // Matches the "Peak {n}" wording of the peak-detail panel.
+        out.push_str(&format!("\nPeak {}", p.id.0));
+    }
+    out
+}
+
 fn plot_group(
     ui: &mut Ui,
     run: &Run,
@@ -167,6 +250,11 @@ fn plot_group(
     // While integrating, dragging draws a selection instead of panning.
     let integrating = view.integrate_mode;
 
+    // Detached before the plot is built so the hover closure borrows nothing the
+    // `show` body below needs mutably.
+    let readout_peaks = hover_peaks(run, &view.peaks, group);
+    let readout_unit = unit.clone();
+
     let mut interaction = None;
     let mut hovered_volume = None;
     Plot::new(format!("chromatogram-{group:?}"))
@@ -184,12 +272,12 @@ fn plot_group(
             .min_thickness(44.0)])
         .x_axis_label(if is_hero { "" } else { "Elution volume (mL)" })
         .legend(egui_plot::Legend::default().position(egui_plot::Corner::RightTop))
-        .label_formatter(|pos| {
+        .label_formatter(move |pos| {
             let p = match pos {
                 egui_plot::HoverPosition::NearDataPoint { position, .. } => position,
                 egui_plot::HoverPosition::Elsewhere { position } => position,
             };
-            Some(format!("{:.3} mL\n{:.3}", p.x, p.y))
+            Some(hover_label(run, &readout_peaks, &readout_unit, p.x, p.y))
         })
         .show(ui, |plot_ui| {
             // Fixed, data-derived extent. Deliberately NOT `plot_ui.plot_bounds()`
@@ -631,5 +719,147 @@ mod tests {
     fn an_empty_group_still_yields_a_usable_extent() {
         let (lo, hi) = data_y_range(&[]);
         assert!(hi > lo, "a degenerate range would make overlays invisible");
+    }
+
+    // --- hover readout ----------------------------------------------------
+
+    use elusive_core::model::{
+        BaselineMode, ChannelId, ChannelKind, RunMeta, Sample, SourceFormat, Well,
+    };
+
+    fn fraction(tube: u32, well: Option<Well>, start: f32, end: f32) -> Fraction {
+        Fraction {
+            tube,
+            rack: 1,
+            well,
+            vol_start_ml: start,
+            vol_end_ml: end,
+            time_start_s: 0.0,
+            time_end_s: 0.0,
+            nominal_size_ml: Some(end - start),
+            end_estimated: false,
+            rack_type: "HEP96".into(),
+            pattern: "Serpentine".into(),
+        }
+    }
+
+    fn peak(id: u32, channel: &str, start: f32, end: f32) -> PeakResult {
+        PeakResult {
+            id: PeakId(id),
+            channel_id: ChannelId::from(channel),
+            v_start_ml: start,
+            v_end_ml: end,
+            baseline: BaselineMode::DropToZero,
+            area: 1.0,
+            height: 1.0,
+            apex_volume_ml: (start + end) / 2.0,
+            fwhm_ml: None,
+            estimated_mw_kda: None,
+        }
+    }
+
+    /// UV and conductivity channels, fractions over 10..13 mL, deliberately not
+    /// stored in volume order.
+    fn hover_run() -> Run {
+        let mut uv = Channel::new("MWave2", "UV 280 nm", ChannelKind::Uv);
+        uv.samples = vec![Sample::new(0.0, 0.0, 0.0), Sample::new(600.0, 20.0, 1.0)];
+        let mut cond = Channel::new("Cond", "Conductivity", ChannelKind::Conductivity);
+        cond.samples = vec![Sample::new(0.0, 0.0, 0.0), Sample::new(600.0, 20.0, 1.0)];
+
+        Run {
+            meta: RunMeta::default(),
+            source_format: SourceFormat::NgcAnalysis,
+            source_path: std::path::PathBuf::from("t.ngcAnalysis"),
+            channels: vec![uv, cond],
+            fractions: vec![
+                fraction(3, Some(Well::new(3, 7)), 12.0, 13.0),
+                fraction(1, Some(Well::new(0, 0)), 10.0, 11.0),
+                fraction(2, Some(Well::new(0, 1)), 11.0, 12.0),
+            ],
+            events: Vec::new(),
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn hover_inside_a_fraction_and_a_peak_reports_both() {
+        let run = hover_run();
+        let peaks = hover_peaks(&run, &[peak(3, "MWave2", 11.8, 12.6)], AxisGroup::Uv);
+        let label = hover_label(&run, &peaks, "mAU", 12.48, 412.6);
+        assert_eq!(label, "12.480 mL\n412.600 mAU\nFraction D8\nPeak 3");
+    }
+
+    #[test]
+    fn hover_outside_every_window_reports_only_the_coordinates() {
+        let run = hover_run();
+        let peaks = hover_peaks(&run, &[peak(1, "MWave2", 11.0, 12.0)], AxisGroup::Uv);
+        let label = hover_label(&run, &peaks, "mAU", 4.0, 1.5);
+        // An "n/a" line would still cost the eye a read, so it is left out.
+        assert_eq!(label, "4.000 mL\n1.500 mAU");
+    }
+
+    #[test]
+    fn hover_inside_a_fraction_without_a_peak_omits_the_peak_line() {
+        let run = hover_run();
+        let label = hover_label(&run, &[], "mAU", 10.5, 22.0);
+        assert_eq!(label, "10.500 mL\n22.000 mAU\nFraction A1");
+    }
+
+    #[test]
+    fn a_peak_on_another_axis_group_is_not_reported() {
+        let run = hover_run();
+        let all = vec![peak(4, "Cond", 10.0, 11.0)];
+
+        // Hovering UV: the conductivity peak's window is meaningless here.
+        let uv = hover_peaks(&run, &all, AxisGroup::Uv);
+        assert!(uv.is_empty());
+        assert_eq!(
+            hover_label(&run, &uv, "mAU", 10.5, 22.0),
+            "10.500 mL\n22.000 mAU\nFraction A1"
+        );
+
+        // Hovering the conductivity plot: same peak, now in context.
+        let cond = hover_peaks(&run, &all, AxisGroup::Conductivity);
+        assert!(hover_label(&run, &cond, "mS/cm", 10.5, 3.0).ends_with("\nPeak 4"));
+    }
+
+    #[test]
+    fn a_peak_whose_channel_is_gone_is_dropped_rather_than_shown_everywhere() {
+        let run = hover_run();
+        let orphan = vec![peak(9, "MWave0", 10.0, 11.0)];
+        assert!(hover_peaks(&run, &orphan, AxisGroup::Uv).is_empty());
+    }
+
+    #[test]
+    fn an_unmapped_rack_falls_back_to_the_tube_number() {
+        let mut run = hover_run();
+        run.fractions = vec![fraction(7, None, 10.0, 11.0)];
+        let label = hover_label(&run, &[], "mAU", 10.5, 1.0);
+        assert!(label.ends_with("\nFraction tube 7"), "{label}");
+    }
+
+    #[test]
+    fn a_degenerate_fraction_window_is_ignored() {
+        let mut run = hover_run();
+        // A zero-width or reversed window cannot contain the pointer in any
+        // meaningful sense; reporting it would name a tube at random.
+        run.fractions = vec![
+            fraction(1, Some(Well::new(0, 0)), 10.0, 10.0),
+            fraction(2, Some(Well::new(0, 1)), f32::NAN, 11.0),
+        ];
+        assert_eq!(
+            hover_label(&run, &[], "mAU", 10.0, 1.0),
+            "10.000 mL\n1.000 mAU"
+        );
+    }
+
+    #[test]
+    fn a_channel_without_a_display_unit_still_reads_cleanly() {
+        let run = hover_run();
+        let label = hover_label(&run, &[], "", 4.0, 1.5);
+        assert_eq!(
+            label, "4.000 mL\n1.500",
+            "no trailing space when unit is blank"
+        );
     }
 }
