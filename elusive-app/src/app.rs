@@ -8,7 +8,7 @@
 use crate::egui_adapter::{self as adapt, c, Mode};
 use crate::theme::{color, measure, spacing, Theme};
 use crate::view::{BaselineChoice, Interaction, Section, View};
-use crate::widgets::{chromatogram, panels, plate};
+use crate::widgets::{self, chromatogram, panels, plate};
 use elusive_core::integrate::{integrate_peak, PlateMetric};
 use elusive_core::model::Run;
 use elusive_core::sidecar;
@@ -713,32 +713,10 @@ fn measured_form<R>(ui: &mut egui::Ui, contents: impl FnOnce(&mut egui::Ui) -> R
     Some(inner)
 }
 
+/// The Overview cards. Their arrangement — how many columns, and in what order —
+/// lives in [`crate::widgets::overview`], which owns the width arithmetic.
 fn overview(ui: &mut egui::Ui, run: &Run, view: &mut View, t: Theme) {
-    egui::ScrollArea::vertical()
-        .id_salt("overview-scroll")
-        .show(ui, |ui| {
-            adapt::card(t).show(ui, |ui| {
-                panels::run_summary(ui, run, t);
-            });
-            ui.add_space(spacing::LG);
-
-            if !run.warnings.is_empty() {
-                adapt::card(t).show(ui, |ui| {
-                    panels::warnings(ui, run, t);
-                });
-                ui.add_space(spacing::LG);
-            }
-
-            adapt::card(t).show(ui, |ui| {
-                panels::channel_table(ui, run, t);
-            });
-            ui.add_space(spacing::LG);
-
-            adapt::card(t).show(ui, |ui| {
-                panels::heading(ui, t, "Fractions");
-                panels::fraction_table(ui, run, view, t);
-            });
-        });
+    widgets::overview::show(ui, run, view, t);
 }
 
 /// The single linked pane: chromatogram above, plate below, detail rail right.

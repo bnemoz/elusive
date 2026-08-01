@@ -89,6 +89,14 @@ pub struct ViewState {
     /// Navigation rail reduced to icons only.
     #[serde(default)]
     pub nav_collapsed: Option<bool>,
+    /// Overview card order, as the app's stable panel-id strings.
+    ///
+    /// Strings rather than an enum on purpose: the core has no opinion about
+    /// which cards the UI shows, and a sidecar written by a build with more
+    /// panels than this one must still load. The app is responsible for dropping
+    /// ids it does not know and appending panels the list does not mention.
+    #[serde(default)]
+    pub overview_order: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -382,6 +390,15 @@ mod tests {
         assert!(s.peaks.is_empty());
         assert!(s.calibrations.is_empty());
         assert_eq!(s.view, ViewState::default());
+    }
+
+    #[test]
+    fn a_sidecar_written_before_overview_order_existed_still_loads() {
+        let json = r#"{"version": 1, "source": {"file_name":"run.ngcAnalysis","run_name":"r"},
+            "view": {"visible_channels":["MWave2"],"show_fractions":true}}"#;
+        let s = from_json(json).unwrap();
+        assert_eq!(s.view.visible_channels, vec!["MWave2".to_string()]);
+        assert!(s.view.overview_order.is_none());
     }
 
     #[test]
