@@ -390,7 +390,10 @@ pub fn peak_table(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) {
     }
 }
 
-/// Columns of the peak export, in the order `sidecar::peaks_to_csv` writes them.
+/// Run-independent columns in the peak preview.
+///
+/// The CSV adds a Fractions column, which requires the loaded run to resolve
+/// collection windows; this compact preview intentionally focuses on peak facts.
 const EXPORT_COLUMNS: [&str; 9] = [
     "Peak",
     "Channel",
@@ -1110,7 +1113,7 @@ fn estimated_mw_for_peak(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use elusive_core::model::{BaselineMode, ChannelId, PeakId};
+    use elusive_core::model::{BaselineMode, ChannelId, PeakId, Run, RunMeta, SourceFormat};
     use elusive_core::sidecar;
 
     fn sample_peak() -> PeakResult {
@@ -1135,15 +1138,20 @@ mod tests {
     }
 
     #[test]
-    fn the_preview_shows_the_same_columns_the_csv_writes() {
-        // The point of the preview is that it previews. If the export schema
-        // gains a column, this fails rather than quietly showing a stale table.
-        let header = sidecar::peaks_to_csv(&[]);
-        assert_eq!(
-            header.trim_end().split(',').count(),
-            EXPORT_COLUMNS.len(),
-            "csv header = {header:?}"
-        );
+    fn the_preview_excludes_only_the_run_dependent_fraction_column() {
+        let run = Run {
+            meta: RunMeta::default(),
+            source_format: SourceFormat::AnalysisCsv,
+            source_path: "test.csv".into(),
+            channels: Vec::new(),
+            fractions: Vec::new(),
+            events: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let header = sidecar::peaks_to_csv(&run, &[]);
+        let columns: Vec<_> = header.trim_end().split(',').collect();
+        assert_eq!(columns.len(), EXPORT_COLUMNS.len() + 1);
+        assert_eq!(columns.last(), Some(&"fractions"));
     }
 
     #[test]

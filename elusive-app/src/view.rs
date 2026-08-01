@@ -70,7 +70,6 @@ impl Section {
             Section::Overview => "☰",
             Section::Chromatograms => "🗠",
             Section::Peaks => "Λ",
-            Section::Integration => "∫",
             Section::Calibration => "⚖",
             Section::Results => "∑",
             Section::Reports => "🖹",
