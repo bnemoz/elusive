@@ -6,11 +6,11 @@
 //! number the instrument measured, so it is not on the table.
 
 use crate::egui_adapter::{self as adapt, c, c_alpha, ca};
-use crate::theme::{chart, color, stroke, Theme};
+use crate::theme::{chart, color, spacing, stroke, Rgb, Theme};
 use crate::view::{Interaction, View};
 use egui::Ui;
 use egui_plot::{Line, Plot, PlotPoints, Polygon};
-use elusive_core::model::{AxisGroup, Channel, Fraction, PeakId, PeakResult, Run};
+use elusive_core::model::{AxisGroup, Channel, Color, Fraction, PeakId, PeakResult, Run};
 
 /// Fraction of the pane's height given to the hero (UV) group.
 const HERO_HEIGHT_SHARE: f32 = 0.55;
@@ -386,6 +386,60 @@ fn plot_group(
     (interaction, hovered_volume)
 }
 
+fn to_rgb(color: Color) -> Rgb {
+    Rgb::new(color.r, color.g, color.b)
+}
+
+fn to_core_color(rgb: Rgb) -> Color {
+    // Traces are lines, not fills: an override is always fully opaque.
+    Color::new(rgb.r, rgb.g, rgb.b, 0xFF)
+}
+
+/// The colour a channel's trace is drawn in.
+///
+/// The single source of truth for both the plot and the legend swatch. The two
+/// used to resolve the colour independently, which is a bug waiting to happen:
+/// the moment they disagree the legend is documenting a colour the plot never
+/// drew, and the reader has no way to tell which one is lying.
+pub fn trace_color(channel: &Channel, index: usize, view: &View, t: Theme) -> Rgb {
+    resolve_trace_color(
+        view.channel_color(&channel.id).map(to_rgb),
+        view.hero_channel_id.as_ref() == Some(&channel.id),
+        channel.color.map(to_rgb),
+        t.panel_bg,
+        index,
+    )
+}
+
+/// Precedence: user override → hero trace → legible ChromLab colour → palette.
+///
+/// The override outranks the contrast gate that
+/// [`chart::legend_color_or_series`] applies to a ChromLab colour, and that
+/// asymmetry is deliberate. A colour the instrument happened to record is a
+/// default we are free to reject; a colour the user typed is an instruction, and
+/// silently substituting a different one would make the hex field lie. Poor
+/// legibility is reported next to the swatch instead (rule #3: never colour alone).
+fn resolve_trace_color(
+    user: Option<Rgb>,
+    is_hero: bool,
+    chromlab: Option<Rgb>,
+    surface: Rgb,
+    index: usize,
+) -> Rgb {
+    if let Some(rgb) = user {
+        return rgb;
+    }
+    if is_hero {
+        return chart::PRIMARY_TRACE;
+    }
+    chart::legend_color_or_series(chromlab, surface, index)
+}
+
+/// Whether a trace colour is too close to the surface to read reliably (§10.4).
+fn is_low_contrast(rgb: Rgb, surface: Rgb) -> bool {
+    rgb.contrast_ratio(surface) < chart::MIN_TRACE_CONTRAST
+}
+
 fn draw_channel(
     plot_ui: &mut egui_plot::PlotUi<'_>,
     channel: &Channel,
@@ -405,15 +459,8 @@ fn draw_channel(
         return;
     }
 
-    let is_hero = view.hero_channel_id.as_ref() == Some(&channel.id);
     let selected = view.selected_channel.as_ref() == Some(&channel.id);
-
-    let rgb = if is_hero {
-        chart::PRIMARY_TRACE
-    } else {
-        let legend = channel.color.map(|c| crate::theme::Rgb::new(c.r, c.g, c.b));
-        chart::legend_color_or_series(legend, t.panel_bg, index)
-    };
+    let rgb = trace_color(channel, index, view, t);
 
     let width = if selected {
         stroke::SELECTED_TRACE
@@ -614,6 +661,36 @@ fn baseline_points(
     vec![[peak.v_start_ml as f64, y0], [peak.v_end_ml as f64, y1]]
 }
 
+/// Width of the legend swatch. The dash patterns below are laid out against it,
+/// so they stay inside the rect.
+const SWATCH_WIDTH: f32 = 24.0;
+/// Taller than the 1.5 px line it contains: the swatch is a click target now, and
+/// a 10 px-high one is not something a user can reliably hit.
+const SWATCH_HEIGHT: f32 = 16.0;
+
+/// Draw a channel's line sample: colour plus dash pattern, because channels past
+/// the eighth are told apart by shape, not hue alone (§10.4).
+fn paint_swatch(painter: &egui::Painter, rect: egui::Rect, rgb: Rgb, dash: chart::Dash) {
+    let y = rect.center().y;
+    let s = egui::Stroke::new(stroke::TRACE, c(rgb));
+    let segment = |x0: f32, len: f32| {
+        painter.line_segment([egui::pos2(x0, y), egui::pos2(x0 + len, y)], s);
+    };
+    match dash {
+        chart::Dash::Solid => segment(rect.left(), rect.width()),
+        chart::Dash::Dashed => {
+            for seg in 0..2 {
+                segment(rect.left() + seg as f32 * 12.0, 8.0);
+            }
+        }
+        chart::Dash::Dotted => {
+            for seg in 0..4 {
+                segment(rect.left() + seg as f32 * 6.0, 2.0);
+            }
+        }
+    }
+}
+
 /// Legend with per-channel visibility, colour swatch, and unit — the control
 /// surface for Phase 2's show/hide requirement.
 pub fn legend(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) {
@@ -630,46 +707,43 @@ pub fn legend(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) {
                         view.set_channel_visible(&channel.id, visible);
                     }
 
-                    let is_hero = view.hero_channel_id.as_ref() == Some(&channel.id);
-                    let rgb = if is_hero {
-                        chart::PRIMARY_TRACE
-                    } else {
-                        let legend = channel.color.map(|c| crate::theme::Rgb::new(c.r, c.g, c.b));
-                        chart::legend_color_or_series(legend, t.panel_bg, i)
-                    };
+                    let rgb = trace_color(channel, i, view, t);
 
-                    // A swatch plus the dash pattern drawn into it: channels past the
-                    // eighth are told apart by shape, not hue alone (§10.4).
-                    let (rect, _) =
-                        ui.allocate_exact_size(egui::vec2(22.0, 10.0), egui::Sense::hover());
-                    let painter = ui.painter();
-                    let y = rect.center().y;
-                    match chart::series_dash(i) {
-                        chart::Dash::Solid => {
-                            painter.line_segment(
-                                [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
-                                egui::Stroke::new(stroke::TRACE, c(rgb)),
-                            );
-                        }
-                        chart::Dash::Dashed => {
-                            for seg in 0..2 {
-                                let x0 = rect.left() + seg as f32 * 12.0;
-                                painter.line_segment(
-                                    [egui::pos2(x0, y), egui::pos2(x0 + 8.0, y)],
-                                    egui::Stroke::new(stroke::TRACE, c(rgb)),
-                                );
-                            }
-                        }
-                        chart::Dash::Dotted => {
-                            for seg in 0..4 {
-                                let x0 = rect.left() + seg as f32 * 6.0;
-                                painter.line_segment(
-                                    [egui::pos2(x0, y), egui::pos2(x0 + 2.0, y)],
-                                    egui::Stroke::new(stroke::TRACE, c(rgb)),
-                                );
-                            }
-                        }
+                    let swatch = ui.allocate_response(
+                        egui::vec2(SWATCH_WIDTH, SWATCH_HEIGHT),
+                        egui::Sense::click(),
+                    );
+                    paint_swatch(ui.painter(), swatch.rect, rgb, chart::series_dash(i));
+                    let swatch = swatch
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text("Click to choose this trace's colour");
+
+                    // Scratch buffer for the hex field, reset on every visit so a
+                    // half-typed value from last time does not reappear.
+                    let hex_id = swatch.id.with("hex-entry");
+                    if swatch.clicked() {
+                        ui.data_mut(|d| d.remove::<String>(hex_id));
                     }
+
+                    if is_low_contrast(rgb, t.panel_bg) {
+                        // Rule #3: the problem with a colour is never reported by
+                        // colour alone, so this is a glyph with a tooltip.
+                        ui.label(
+                            egui::RichText::new("⚠")
+                                .font(adapt::font_micro())
+                                .color(c(color::WARNING_600)),
+                        )
+                        .on_hover_text(
+                            "Low contrast against the plot background — this trace may be hard to see",
+                        );
+                    }
+
+                    egui::Popup::from_toggle_button_response(&swatch)
+                        // The default closes on any click, which would dismiss the
+                        // popup the instant the user touched the colour wheel.
+                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                        .frame(adapt::card(t))
+                        .show(|ui| color_editor(ui, channel, i, view, t, hex_id));
 
                     let label = ui.selectable_label(
                         view.selected_channel.as_ref() == Some(&channel.id),
@@ -691,6 +765,95 @@ pub fn legend(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) {
                 });
             }
         });
+}
+
+/// The colour picker behind a legend swatch.
+///
+/// egui 0.35's `color_picker_color32` offers a wheel and R/G/B drag values but no
+/// hex field, and a hex code is how a colour actually travels between a figure, a
+/// protocol, and a colleague — so one is added here.
+fn color_editor(
+    ui: &mut Ui,
+    channel: &Channel,
+    index: usize,
+    view: &mut View,
+    t: Theme,
+    hex_id: egui::Id,
+) {
+    ui.set_max_width(240.0);
+    ui.label(
+        egui::RichText::new(&channel.name)
+            .font(adapt::font_h3())
+            .color(c(t.text_primary)),
+    );
+    ui.add_space(spacing::SM);
+
+    let current = trace_color(channel, index, view, t);
+    let mut picked = c(current);
+    // Opaque: a semi-transparent line reads as a different colour wherever it
+    // crosses a fraction zone, so the swatch would stop matching the trace.
+    if egui::color_picker::color_picker_color32(ui, &mut picked, egui::color_picker::Alpha::Opaque)
+    {
+        let rgb = Rgb::new(picked.r(), picked.g(), picked.b());
+        view.set_channel_color(&channel.id, to_core_color(rgb));
+        // Keep the hex field showing what the wheel just produced.
+        ui.data_mut(|d| d.insert_temp(hex_id, rgb.hex_string()));
+    }
+
+    ui.add_space(spacing::SM);
+    let mut text = ui
+        .data_mut(|d| d.get_temp::<String>(hex_id))
+        .unwrap_or_else(|| current.hex_string());
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new("Hex")
+                .font(adapt::font_micro())
+                .color(c(t.text_secondary)),
+        );
+        let edit = ui.add(
+            egui::TextEdit::singleline(&mut text)
+                .desired_width(90.0)
+                .font(adapt::font_code())
+                .hint_text("#RRGGBB"),
+        );
+        if edit.changed() {
+            // Only a complete, well-formed value is applied. Anything else leaves
+            // the trace alone while the user keeps typing.
+            if let Some(rgb) = Rgb::from_hex_str(&text) {
+                view.set_channel_color(&channel.id, to_core_color(rgb));
+            }
+        }
+    });
+    let parsed = Rgb::from_hex_str(&text);
+    ui.data_mut(|d| d.insert_temp(hex_id, text));
+
+    if parsed.is_none() {
+        ui.label(
+            egui::RichText::new("Enter six hex digits, e.g. #2F6FB3")
+                .font(adapt::font_micro())
+                .color(c(color::WARNING_600)),
+        );
+    } else if is_low_contrast(current, t.panel_bg) {
+        // The user's choice still wins — this only tells them what they are
+        // trading away (§10.4 rejects an *instrument* colour, not a chosen one).
+        ui.label(
+            egui::RichText::new("⚠ Low contrast against the plot background")
+                .font(adapt::font_micro())
+                .color(c(color::WARNING_600)),
+        );
+    }
+
+    ui.add_space(spacing::SM);
+    let overridden = view.channel_color(&channel.id).is_some();
+    if ui
+        .add_enabled(overridden, egui::Button::new("Reset to default"))
+        .on_disabled_hover_text("This channel is already using its default colour")
+        .clicked()
+    {
+        view.clear_channel_color(&channel.id);
+        // Drop the buffer too, so the field redraws from the restored default.
+        ui.data_mut(|d| d.remove::<String>(hex_id));
+    }
 }
 
 #[cfg(test)]
@@ -769,6 +932,8 @@ mod tests {
         assert_eq!(x_axis_label_for(0, 3), "");
         assert_eq!(x_axis_label_for(1, 3), "");
         assert_eq!(x_axis_label_for(2, 3), "Elution volume (mL)");
+    }
+
     // --- hover readout ----------------------------------------------------
 
     use elusive_core::model::{
@@ -909,5 +1074,92 @@ mod tests {
             label, "4.000 mL\n1.500",
             "no trailing space when unit is blank"
         );
+    }
+
+    // --- trace colour resolution -----------------------------------------
+
+    const SURFACE: Rgb = crate::theme::color::WHITE;
+    const PICKED: Rgb = Rgb::new(0xC4, 0x77, 0x3D);
+    const CHROMLAB: Rgb = Rgb::new(0x20, 0x40, 0x60);
+
+    #[test]
+    fn a_chosen_colour_outranks_every_automatic_one() {
+        // Including the hero trace and a legible ChromLab colour: an explicit
+        // choice is an instruction, not a suggestion.
+        assert_eq!(
+            resolve_trace_color(Some(PICKED), true, Some(CHROMLAB), SURFACE, 3),
+            PICKED
+        );
+        assert_eq!(
+            resolve_trace_color(Some(PICKED), false, None, SURFACE, 3),
+            PICKED
+        );
+    }
+
+    #[test]
+    fn an_illegible_choice_is_still_honoured() {
+        // §10.4's contrast gate rejects an *instrument* colour. Substituting a
+        // different colour for one the user typed would make the hex field lie;
+        // the legend warns instead.
+        let washed_out = Rgb::new(0xFA, 0xFB, 0xFC);
+        assert_eq!(
+            resolve_trace_color(Some(washed_out), false, None, SURFACE, 3),
+            washed_out
+        );
+        assert!(is_low_contrast(washed_out, SURFACE));
+        assert!(!is_low_contrast(chart::PRIMARY_TRACE, SURFACE));
+    }
+
+    #[test]
+    fn without_an_override_the_documented_precedence_holds() {
+        // hero → legible ChromLab colour → series palette.
+        assert_eq!(
+            resolve_trace_color(None, true, Some(CHROMLAB), SURFACE, 3),
+            chart::PRIMARY_TRACE
+        );
+        assert_eq!(
+            resolve_trace_color(None, false, Some(CHROMLAB), SURFACE, 3),
+            CHROMLAB
+        );
+        assert_eq!(
+            resolve_trace_color(None, false, None, SURFACE, 3),
+            chart::series_color(3)
+        );
+        // An illegible instrument colour still loses to the palette.
+        assert_eq!(
+            resolve_trace_color(None, false, Some(Rgb::new(0xFA, 0xFB, 0xFC)), SURFACE, 3),
+            chart::series_color(3)
+        );
+    }
+
+    #[test]
+    fn the_plot_and_the_legend_read_the_same_colour_for_a_channel() {
+        // The regression this guards: two call sites resolving independently and
+        // drifting, so the legend documents a colour the plot never drew. Both
+        // now go through `trace_color`, which is what this exercises.
+        use elusive_core::model::{Channel, ChannelKind, Sample};
+
+        let mut uv = Channel::new("MWave2", "UV 280 nm", ChannelKind::Uv);
+        uv.samples = vec![Sample::new(0.0, 0.0, 0.0), Sample::new(60.0, 1.0, 0.5)];
+        uv.color = Some(Color::new(0x20, 0x40, 0x60, 0xFF));
+
+        let t = crate::theme::LIGHT;
+        let mut view = View::default();
+        view.hero_channel_id = Some(uv.id.clone());
+        assert_eq!(trace_color(&uv, 0, &view, t), chart::PRIMARY_TRACE);
+
+        view.set_channel_color(&uv.id, to_core_color(PICKED));
+        assert_eq!(trace_color(&uv, 0, &view, t), PICKED);
+
+        view.clear_channel_color(&uv.id);
+        view.hero_channel_id = None;
+        assert_eq!(trace_color(&uv, 0, &view, t), CHROMLAB);
+    }
+
+    #[test]
+    fn a_colour_survives_the_trip_through_the_core_representation() {
+        // The picker hands back an `Rgb`; the sidecar stores a core `Color`.
+        assert_eq!(to_rgb(to_core_color(PICKED)), PICKED);
+        assert_eq!(to_core_color(PICKED).a, 0xFF);
     }
 }

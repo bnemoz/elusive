@@ -29,6 +29,33 @@ impl Rgb {
         ((self.r as u32) << 16) | ((self.g as u32) << 8) | self.b as u32
     }
 
+    /// Parse a hand-typed sRGB colour: `#RRGGBB` or `RRGGBB`.
+    ///
+    /// Returns `None` on anything else rather than falling back to a colour, so a
+    /// caller editing a text field can leave a half-typed value alone instead of
+    /// flashing a shade the user never asked for.
+    pub fn from_hex_str(s: &str) -> Option<Rgb> {
+        let s = s.trim();
+        let digits = s.strip_prefix('#').unwrap_or(s);
+        // `u32::from_str_radix` accepts a leading `+`, so `+12345` would pass a
+        // length-only check and parse to a colour the user did not type. The
+        // digits are therefore validated explicitly.
+        if digits.len() != 6 || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let v = u32::from_str_radix(digits, 16).ok()?;
+        Some(Rgb::new(
+            ((v >> 16) & 0xFF) as u8,
+            ((v >> 8) & 0xFF) as u8,
+            (v & 0xFF) as u8,
+        ))
+    }
+
+    /// Canonical `#RRGGBB` form, for a hex field the user can read back and copy.
+    pub fn hex_string(self) -> String {
+        format!("#{:02X}{:02X}{:02X}", self.r, self.g, self.b)
+    }
+
     /// Blend towards `other` by `t` in 0..=1, in linear-ish sRGB space.
     ///
     /// Used for the plate ramp, where the interpolation has to be monotonic in
@@ -538,6 +565,27 @@ mod tests {
         for available in [1.0, 120.0, measure::FORM_MIN - 1.0, measure::FORM_MIN] {
             assert_eq!(measure::content_width(available), available);
             assert_eq!(measure::leading_pad(available), 0.0);
+        }
+    }
+
+    #[test]
+    fn hex_strings_round_trip_with_or_without_the_hash() {
+        let teal = Rgb::new(0x2E, 0x95, 0x99);
+        assert_eq!(teal.hex_string(), "#2E9599");
+        assert_eq!(Rgb::from_hex_str("#2E9599"), Some(teal));
+        assert_eq!(Rgb::from_hex_str("2e9599"), Some(teal));
+        assert_eq!(Rgb::from_hex_str("  #2E9599  "), Some(teal));
+    }
+
+    #[test]
+    fn malformed_hex_is_rejected_rather_than_guessed_at() {
+        // A colour field is typed into character by character, so every
+        // intermediate state must be a clean rejection, never a panic and never
+        // a silently different colour.
+        for bad in [
+            "", "#", "#2E959", "#2E95999", "2E959G", "#+12345", "-123456", "#FFFF", "rebecca",
+        ] {
+            assert_eq!(Rgb::from_hex_str(bad), None, "{bad:?} should not parse");
         }
     }
 

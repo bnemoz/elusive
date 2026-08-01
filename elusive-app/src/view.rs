@@ -12,9 +12,9 @@
 
 use elusive_core::calibration::{Calibration, CalibrationPoint, Extinction};
 use elusive_core::integrate::PlateMetric;
-use elusive_core::model::{BaselineMode, ChannelId, PeakId, PeakResult, Run, Well};
+use elusive_core::model::{BaselineMode, ChannelId, Color, PeakId, PeakResult, Run, Well};
 use elusive_core::sidecar::{Annotation, ExcludedRegion, NamedCalibration, Sidecar, ViewState};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Something the user did in a widget that the app must act on.
 #[derive(Clone, Debug, PartialEq)]
@@ -244,6 +244,11 @@ pub struct View {
     pub selected_channel: Option<ChannelId>,
     pub hero_channel_id: Option<ChannelId>,
     pub show_fractions: bool,
+    /// Trace colours the user picked from the legend, overriding every automatic
+    /// choice. Stored as the core [`Color`] rather than a `theme::Rgb` so the
+    /// override and the ChromLab legend colour it replaces share one
+    /// representation, and the sidecar gains no second colour encoding.
+    pub channel_colors: BTreeMap<ChannelId, Color>,
 
     /// Overview card order, left-to-right then top-to-bottom through the columns.
     pub overview_order: Vec<PanelId>,
@@ -294,6 +299,7 @@ impl Default for View {
             hero_channel_id: None,
             show_fractions: true,
             overview_order: PanelId::ALL.to_vec(),
+            channel_colors: BTreeMap::new(),
             hovered_vol_range: None,
             hovered_well: None,
             hovered_volume: None,
@@ -325,6 +331,7 @@ impl View {
     /// Reset per-run state and adopt sensible defaults for a freshly opened run.
     pub fn adopt_run(&mut self, run: &Run) {
         self.hidden_channels.clear();
+        self.channel_colors.clear();
         self.peaks.clear();
         self.excluded_regions.clear();
         self.annotations.clear();
@@ -389,6 +396,29 @@ impl View {
         }
     }
 
+    /// The user's chosen colour for a channel, if they set one.
+    pub fn channel_color(&self, id: &ChannelId) -> Option<Color> {
+        self.channel_colors.get(id).copied()
+    }
+
+    /// Override a channel's trace colour.
+    ///
+    /// Forced opaque: a trace is a line, not a fill, and a semi-transparent line
+    /// over a fraction zone reads as a different colour than the legend swatch.
+    pub fn set_channel_color(&mut self, id: &ChannelId, color: Color) {
+        let color = Color::new(color.r, color.g, color.b, 0xFF);
+        if self.channel_colors.insert(id.clone(), color) != Some(color) {
+            self.dirty = true;
+        }
+    }
+
+    /// Drop an override so the channel falls back to the automatic colour.
+    pub fn clear_channel_color(&mut self, id: &ChannelId) {
+        if self.channel_colors.remove(id).is_some() {
+            self.dirty = true;
+        }
+    }
+
     pub fn set_show_fractions(&mut self, show: bool) {
         if self.show_fractions != show {
             self.show_fractions = show;
@@ -404,6 +434,10 @@ impl View {
     pub fn set_nav_collapsed(&mut self, collapsed: bool) {
         if self.nav_collapsed != collapsed {
             self.nav_collapsed = collapsed;
+            self.dirty = true;
+        }
+    }
+
     /// Drop the panel `dragged` into the slot `target` currently occupies.
     ///
     /// Takes panels rather than indices because the drag payload is a panel and
@@ -538,6 +572,12 @@ impl View {
                     .map(|p| p.as_str().to_string())
                     .collect(),
             ),
+            channel_colors: Some(
+                self.channel_colors
+                    .iter()
+                    .map(|(id, color)| (id.0.clone(), *color))
+                    .collect(),
+            ),
         };
         sidecar
     }
@@ -614,6 +654,16 @@ impl View {
         }
         if let Some(saved) = &sidecar.view.overview_order {
             self.overview_order = restore_order(saved);
+        }
+        if let Some(colors) = &sidecar.view.channel_colors {
+            // An override for a channel this run lacks is dropped without a note.
+            // Unlike an orphaned peak it carries no measurement, so warning about
+            // it would be noise on every reopen of a re-exported run.
+            self.channel_colors = colors
+                .iter()
+                .filter(|(id, _)| run.channels.iter().any(|c| c.id.0 == **id))
+                .map(|(id, color)| (ChannelId(id.clone()), *color))
+                .collect();
         }
 
         self.dirty = false;
@@ -705,6 +755,10 @@ mod tests {
         view.set_show_fractions(false);
         view.set_plate_uniform_ramp(true);
         view.set_nav_collapsed(true);
+        view.set_channel_color(
+            &ChannelId::from("MWave2"),
+            Color::new(0xC4, 0x77, 0x3D, 0xFF),
+        );
         let peak_id = view.allocate_peak_id();
         view.add_peak(PeakResult {
             id: peak_id,
@@ -729,6 +783,10 @@ mod tests {
         assert!(!restored.show_fractions);
         assert!(restored.plate_uniform_ramp);
         assert!(restored.nav_collapsed);
+        assert_eq!(
+            restored.channel_color(&ChannelId::from("MWave2")),
+            Some(Color::new(0xC4, 0x77, 0x3D, 0xFF))
+        );
         assert!(!restored.dirty, "a freshly loaded sidecar is not dirty");
     }
 
@@ -743,6 +801,54 @@ mod tests {
         sidecar.view.nav_collapsed = None;
         view.apply_sidecar(&sidecar, &run);
         assert!(view.nav_collapsed);
+    }
+
+    #[test]
+    fn a_sidecar_written_before_colour_overrides_existed_still_loads() {
+        // `channel_colors: None` is what an older file deserializes to (the
+        // wire-format half of this is checked in `elusive-core`'s sidecar tests).
+        let run = test_run();
+        let mut sidecar = Sidecar::for_run(&run);
+        sidecar.view.channel_colors = None;
+
+        let mut view = View::default();
+        view.adopt_run(&run);
+        view.set_channel_color(&ChannelId::from("MWave2"), Color::new(1, 2, 3, 0xFF));
+        view.apply_sidecar(&sidecar, &run);
+        assert_eq!(
+            view.channel_color(&ChannelId::from("MWave2")),
+            Some(Color::new(1, 2, 3, 0xFF)),
+            "a sidecar with no opinion must not silently clear the session's colours"
+        );
+    }
+
+    #[test]
+    fn a_colour_override_is_stored_opaque_and_marks_the_view_dirty() {
+        let mut view = View::default();
+        let id = ChannelId::from("MWave2");
+        assert!(!view.dirty);
+
+        // Traces are lines, not fills; the stored alpha is always 0xFF.
+        view.set_channel_color(&id, Color::new(0x2E, 0x95, 0x99, 0x40));
+        assert_eq!(
+            view.channel_color(&id),
+            Some(Color::new(0x2E, 0x95, 0x99, 0xFF))
+        );
+        assert!(view.dirty);
+
+        // Re-picking the same colour is not a change worth re-saving for.
+        view.dirty = false;
+        view.set_channel_color(&id, Color::new(0x2E, 0x95, 0x99, 0xFF));
+        assert!(!view.dirty);
+
+        view.clear_channel_color(&id);
+        assert_eq!(view.channel_color(&id), None);
+        assert!(view.dirty);
+
+        // Clearing an override that was never set is likewise a no-op.
+        view.dirty = false;
+        view.clear_channel_color(&id);
+        assert!(!view.dirty);
     }
 
     #[test]
