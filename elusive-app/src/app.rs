@@ -459,7 +459,7 @@ impl EluSiveApp {
 
                 match view.section {
                     Section::Overview => overview(ui, run, view, t),
-                    Section::Chromatograms | Section::Peaks | Section::Integration => {
+                    Section::Chromatograms | Section::Peaks => {
                         if let Some(action) = linked_pane(ui, run, view, t) {
                             let ctx = ui.ctx().clone();
                             self.handle(&ctx, action);
@@ -651,7 +651,7 @@ fn linked_pane(ui: &mut egui::Ui, run: &Run, view: &mut View, t: Theme) -> Optio
         });
 
     // Peak table under the chart when the user is working on peaks.
-    if matches!(view.section, Section::Peaks | Section::Integration) {
+    if view.section == Section::Peaks {
         egui::Panel::bottom("peak-pane")
             .resizable(true)
             .default_size(180.0)

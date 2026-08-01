@@ -287,7 +287,7 @@ EluSive theme (§16, `elusive-app/src/theme.rs`).
 
 Layout follows the brand mockup, adapted to EluSive's prep-chromatography domain:
 - **Dark navy sidebar** (`INK_900`) with the wordmark + tagline and the nav sections:
-  Overview · Chromatograms · Peaks · Integration · Calibration · Results · Reports.
+  Overview · Chromatograms · Peaks · Calibration · Results · Reports.
   Settings/Help pinned at the bottom.
 - **Light content area** with white cards (dark mode: deep-navy cards). On big
   screens, a **single linked pane**: chromatogram (top, most height) + HEP96 plate
