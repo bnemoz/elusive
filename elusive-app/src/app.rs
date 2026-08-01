@@ -199,13 +199,11 @@ impl EluSiveApp {
                 let baseline = self.view.baseline_choice.resolve(v0, v1);
                 match integrate_peak(id, channel, v0, v1, baseline) {
                     Ok(mut peak) => {
-                        if let Some(cal) = &self.view.calibration
-                            && channel.kind == elusive_core::model::ChannelKind::Uv
-                        {
-                            peak.estimated_mw_kda = cal.mw_for_volume(peak.apex_volume_ml);
-                        } else {
-                            peak.estimated_mw_kda = None;
-                        }
+                        peak.estimated_mw_kda = self
+                            .view
+                            .calibration
+                            .as_ref()
+                            .and_then(|cal| estimated_mw(cal, channel, peak.apex_volume_ml));
                         let summary = format!(
                             "Integrated {} on {}: area {:.2} {}·mL",
                             peak.id, channel.name, peak.area, channel.display_unit
@@ -478,6 +476,23 @@ impl EluSiveApp {
                 }
             });
     }
+}
+
+/// Estimated molecular weight for a peak, or `None` when the question does not
+/// apply.
+///
+/// A SEC curve maps the elution volume of an *absorbance* peak to a mass, so
+/// stamping an MW onto a conductivity or pressure peak would be a number with no
+/// meaning behind it. Gating here keeps that rule in one place, shared by
+/// freshly-integrated peaks and by a re-fit that restamps them all.
+pub fn estimated_mw(
+    calibration: &elusive_core::calibration::Calibration,
+    channel: &elusive_core::model::Channel,
+    apex_volume_ml: f32,
+) -> Option<f64> {
+    (channel.kind == elusive_core::model::ChannelKind::Uv)
+        .then(|| calibration.mw_for_volume(apex_volume_ml))
+        .flatten()
 }
 
 fn stem(run: &Run) -> String {

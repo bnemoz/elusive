@@ -543,7 +543,10 @@ pub fn calibration_panel(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) {
                     .font(font_micro())
                     .color(c(t.text_secondary)),
             );
-            if ui.add(egui::DragValue::new(&mut view.v0_ml).speed(0.01)).changed() {
+            if ui
+                .add(egui::DragValue::new(&mut view.v0_ml).speed(0.01))
+                .changed()
+            {
                 view.dirty = true;
             }
             ui.label(
@@ -551,7 +554,10 @@ pub fn calibration_panel(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) {
                     .font(font_micro())
                     .color(c(t.text_secondary)),
             );
-            if ui.add(egui::DragValue::new(&mut view.vt_ml).speed(0.01)).changed() {
+            if ui
+                .add(egui::DragValue::new(&mut view.vt_ml).speed(0.01))
+                .changed()
+            {
                 view.dirty = true;
             }
         }
@@ -707,9 +713,9 @@ fn concentration_panel(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) {
             );
             if ui
                 .add(
-                egui::DragValue::new(&mut view.concentration.e_mg_per_ml)
-                    .speed(0.01)
-                    .range(0.0001..=1000.0),
+                    egui::DragValue::new(&mut view.concentration.e_mg_per_ml)
+                        .speed(0.01)
+                        .range(0.0001..=1000.0),
                 )
                 .changed()
             {
@@ -726,9 +732,9 @@ fn concentration_panel(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) {
         );
         if ui
             .add(
-            egui::DragValue::new(&mut view.concentration.path_length_cm)
-                .speed(0.01)
-                .range(0.0001..=10.0),
+                egui::DragValue::new(&mut view.concentration.path_length_cm)
+                    .speed(0.01)
+                    .range(0.0001..=10.0),
             )
             .changed()
         {
