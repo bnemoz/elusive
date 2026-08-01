@@ -573,7 +573,10 @@ fn linked_pane(ui: &mut egui::Ui, run: &Run, view: &mut View, t: Theme) -> Optio
     let mut plate_hover = None;
 
     egui::Panel::right("detail-rail")
-        .exact_size(300.0)
+        .resizable(true)
+        .default_width(340.0)
+        .min_width(260.0)
+        .max_width(640.0)
         .frame(adapt::card(t))
         .show(ui, |ui| {
             egui::ScrollArea::vertical()

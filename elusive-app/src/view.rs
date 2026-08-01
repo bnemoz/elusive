@@ -310,6 +310,18 @@ impl View {
         }
     }
 
+    /// Make a channel the current focus of the chromatogram UI.
+    ///
+    /// Selection itself is transient UI state, but focusing a hidden channel is
+    /// treated as intent to see it, so the channel is also revealed.
+    pub fn focus_channel(&mut self, id: &ChannelId) {
+        self.selected_channel = Some(id.clone());
+        self.hero_channel_id = Some(id.clone());
+        if self.hidden_channels.remove(id) {
+            self.dirty = true;
+        }
+    }
+
     /// Allocate the next peak id. Ids never repeat within a session, so a peak
     /// deleted and re-created is distinguishable in an export.
     pub fn allocate_peak_id(&mut self) -> PeakId {

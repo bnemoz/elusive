@@ -16,10 +16,11 @@ use elusive_core::model::{AxisGroup, Channel, Run};
 const HERO_HEIGHT_SHARE: f32 = 0.55;
 const MIN_GROUP_HEIGHT: f32 = 90.0;
 
-/// Height of a fraction boundary tick as a fraction of the plot's y-range.
-/// Deliberately small: §10.2 requires the ticks not to span full height so the
-/// raw trace stays dominant (rule #2).
-const FRACTION_TICK_SHARE: f64 = 0.06;
+/// Alpha of the per-fraction background zone.
+///
+/// Faint on purpose: the trace still has to dominate, but the user needs the
+/// fraction windows to remain legible after vertical pan/zoom.
+const FRACTION_ZONE_ALPHA: u8 = 18;
 
 /// What the chromatogram pane observed this frame.
 ///
@@ -65,7 +66,12 @@ pub fn show(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) -> ChartOutcome {
 
 /// Axis groups that currently have at least one visible channel, hero group first.
 fn visible_groups(run: &Run, view: &View) -> Vec<AxisGroup> {
-    let hero_group = run.hero_channel().map(|c| c.kind.axis_group());
+    let hero_group = view
+        .hero_channel_id
+        .as_ref()
+        .and_then(|id| run.channel(id))
+        .or_else(|| run.hero_channel())
+        .map(|c| c.kind.axis_group());
     let mut groups: Vec<AxisGroup> = run
         .channels
         .iter()
@@ -165,6 +171,7 @@ fn plot_group(
     let mut hovered_volume = None;
     Plot::new(format!("chromatogram-{group:?}"))
         .height(height)
+        .sense(egui::Sense::click_and_drag())
         .link_axis("chromatogram-x", [true, false])
         .allow_drag([!integrating, !integrating])
         .allow_boxed_zoom(!integrating)
@@ -188,11 +195,10 @@ fn plot_group(
             // Fixed, data-derived extent. Deliberately NOT `plot_ui.plot_bounds()`
             // — see `data_y_range`.
             let (y_lo, y_hi) = data_y_range(&channels);
-            let y_span = (y_hi - y_lo).max(f64::MIN_POSITIVE);
 
             // 1. Fraction bands sit *under* the traces so the signal stays on top.
             if is_hero {
-                draw_fraction_ticks(plot_ui, run, view, t, y_lo, y_span);
+                draw_fraction_zones(plot_ui, run, view, t, y_lo, y_hi);
                 draw_highlighted_span(plot_ui, view, t, y_lo, y_hi);
                 draw_excluded_regions(plot_ui, view, t, y_lo, y_hi);
             }
@@ -235,15 +241,15 @@ fn plot_group(
             }
 
             if integrating {
-                if response.drag_started() {
+                if response.drag_started_by(egui::PointerButton::Primary) {
                     view.drag_anchor = pointer.map(|p| p.x as f32);
                 }
-                if response.dragged() {
+                if response.dragged_by(egui::PointerButton::Primary) {
                     if let (Some(anchor), Some(p)) = (view.drag_anchor, pointer) {
                         view.pending_selection = Some((anchor, p.x as f32));
                     }
                 }
-                if response.drag_stopped() {
+                if response.drag_stopped_by(egui::PointerButton::Primary) {
                     if let Some((a, b)) = view.pending_selection.take() {
                         if (b - a).abs() > f32::EPSILON {
                             interaction = Some(Interaction::IntegrateRange(a.min(b), a.max(b)));
@@ -299,48 +305,46 @@ fn draw_channel(
     );
 }
 
-/// Fraction boundaries as short ticks at the baseline (§10.2).
-fn draw_fraction_ticks(
+/// Fraction windows as faint full-height zones.
+///
+/// Baseline ticks disappeared as soon as the user panned away from the baseline.
+/// A very low-alpha zone keeps the windows visible without competing with the
+/// chromatogram.
+fn draw_fraction_zones(
     plot_ui: &mut egui_plot::PlotUi<'_>,
     run: &Run,
     view: &View,
     t: Theme,
     y_lo: f64,
-    y_span: f64,
+    y_hi: f64,
 ) {
     if !view.show_fractions || run.fractions.is_empty() {
         return;
     }
-    let tick_top = y_lo + y_span * FRACTION_TICK_SHARE;
-    let tick_color = c_alpha(t.axis, 160);
-
-    for f in &run.fractions {
-        let (a, _) = f.volume_window();
-        if !a.is_finite() {
+    for (idx, f) in run.fractions.iter().enumerate() {
+        let (a, b) = f.volume_window();
+        if !a.is_finite() || !b.is_finite() || b <= a {
             continue;
         }
-        plot_ui.line(
-            Line::new(
+        let alpha = if idx % 2 == 0 {
+            FRACTION_ZONE_ALPHA
+        } else {
+            FRACTION_ZONE_ALPHA.saturating_add(6)
+        };
+        plot_ui.polygon(
+            Polygon::new(
                 "",
-                PlotPoints::from(vec![[a as f64, y_lo], [a as f64, tick_top]]),
+                PlotPoints::from(vec![
+                    [a as f64, y_lo],
+                    [b as f64, y_lo],
+                    [b as f64, y_hi],
+                    [a as f64, y_hi],
+                ]),
             )
-            .stroke(egui::Stroke::new(stroke::HAIRLINE, tick_color))
+            .fill_color(c_alpha(t.fraction_highlight, alpha))
+            .stroke(egui::Stroke::new(stroke::HAIRLINE, c_alpha(t.axis, 60)))
             .allow_hover(false),
         );
-    }
-    // Close the last fraction so the final window reads as bounded.
-    if let Some(last) = run.fractions.last() {
-        let (_, b) = last.volume_window();
-        if b.is_finite() {
-            plot_ui.line(
-                Line::new(
-                    "",
-                    PlotPoints::from(vec![[b as f64, y_lo], [b as f64, tick_top]]),
-                )
-                .stroke(egui::Stroke::new(stroke::HAIRLINE, tick_color))
-                .allow_hover(false),
-            );
-        }
     }
 }
 
@@ -490,75 +494,80 @@ fn baseline_points(
 /// Legend with per-channel visibility, colour swatch, and unit — the control
 /// surface for Phase 2's show/hide requirement.
 pub fn legend(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) {
-    for (i, channel) in run.channels.iter().enumerate() {
-        if channel.is_empty() {
-            continue;
-        }
-        let mut visible = view.is_channel_visible(&channel.id);
-        ui.horizontal(|ui| {
-            if ui.checkbox(&mut visible, "").changed() {
-                view.set_channel_visible(&channel.id, visible);
-            }
+    egui::ScrollArea::vertical()
+        .id_salt("channel-legend")
+        .show(ui, |ui| {
+            for (i, channel) in run.channels.iter().enumerate() {
+                if channel.is_empty() {
+                    continue;
+                }
+                let mut visible = view.is_channel_visible(&channel.id);
+                ui.horizontal(|ui| {
+                    if ui.checkbox(&mut visible, "").changed() {
+                        view.set_channel_visible(&channel.id, visible);
+                    }
 
-            let is_hero = view.hero_channel_id.as_ref() == Some(&channel.id);
-            let rgb = if is_hero {
-                chart::PRIMARY_TRACE
-            } else {
-                let legend = channel.color.map(|c| crate::theme::Rgb::new(c.r, c.g, c.b));
-                chart::legend_color_or_series(legend, t.panel_bg, i)
-            };
+                    let is_hero = view.hero_channel_id.as_ref() == Some(&channel.id);
+                    let rgb = if is_hero {
+                        chart::PRIMARY_TRACE
+                    } else {
+                        let legend = channel.color.map(|c| crate::theme::Rgb::new(c.r, c.g, c.b));
+                        chart::legend_color_or_series(legend, t.panel_bg, i)
+                    };
 
-            // A swatch plus the dash pattern drawn into it: channels past the
-            // eighth are told apart by shape, not hue alone (§10.4).
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(22.0, 10.0), egui::Sense::hover());
-            let painter = ui.painter();
-            let y = rect.center().y;
-            match chart::series_dash(i) {
-                chart::Dash::Solid => {
-                    painter.line_segment(
-                        [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
-                        egui::Stroke::new(stroke::TRACE, c(rgb)),
+                    // A swatch plus the dash pattern drawn into it: channels past the
+                    // eighth are told apart by shape, not hue alone (§10.4).
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(22.0, 10.0), egui::Sense::hover());
+                    let painter = ui.painter();
+                    let y = rect.center().y;
+                    match chart::series_dash(i) {
+                        chart::Dash::Solid => {
+                            painter.line_segment(
+                                [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+                                egui::Stroke::new(stroke::TRACE, c(rgb)),
+                            );
+                        }
+                        chart::Dash::Dashed => {
+                            for seg in 0..2 {
+                                let x0 = rect.left() + seg as f32 * 12.0;
+                                painter.line_segment(
+                                    [egui::pos2(x0, y), egui::pos2(x0 + 8.0, y)],
+                                    egui::Stroke::new(stroke::TRACE, c(rgb)),
+                                );
+                            }
+                        }
+                        chart::Dash::Dotted => {
+                            for seg in 0..4 {
+                                let x0 = rect.left() + seg as f32 * 6.0;
+                                painter.line_segment(
+                                    [egui::pos2(x0, y), egui::pos2(x0 + 2.0, y)],
+                                    egui::Stroke::new(stroke::TRACE, c(rgb)),
+                                );
+                            }
+                        }
+                    }
+
+                    let label = ui.selectable_label(
+                        view.selected_channel.as_ref() == Some(&channel.id),
+                        egui::RichText::new(&channel.name).color(c(t.text_primary)),
                     );
-                }
-                chart::Dash::Dashed => {
-                    for seg in 0..2 {
-                        let x0 = rect.left() + seg as f32 * 12.0;
-                        painter.line_segment(
-                            [egui::pos2(x0, y), egui::pos2(x0 + 8.0, y)],
-                            egui::Stroke::new(stroke::TRACE, c(rgb)),
-                        );
+                    if label.clicked() {
+                        view.focus_channel(&channel.id);
                     }
-                }
-                chart::Dash::Dotted => {
-                    for seg in 0..4 {
-                        let x0 = rect.left() + seg as f32 * 6.0;
-                        painter.line_segment(
-                            [egui::pos2(x0, y), egui::pos2(x0 + 2.0, y)],
-                            egui::Stroke::new(stroke::TRACE, c(rgb)),
-                        );
-                    }
-                }
-            }
 
-            let label = ui.selectable_label(
-                view.selected_channel.as_ref() == Some(&channel.id),
-                egui::RichText::new(&channel.name).color(c(t.text_primary)),
-            );
-            if label.clicked() {
-                view.selected_channel = Some(channel.id.clone());
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} · {} pts",
+                            channel.display_unit,
+                            channel.samples.len()
+                        ))
+                        .font(adapt::font_micro())
+                        .color(c(t.text_secondary)),
+                    );
+                });
             }
-
-            ui.label(
-                egui::RichText::new(format!(
-                    "{} · {} pts",
-                    channel.display_unit,
-                    channel.samples.len()
-                ))
-                .font(adapt::font_micro())
-                .color(c(t.text_secondary)),
-            );
         });
-    }
 }
 
 #[cfg(test)]
