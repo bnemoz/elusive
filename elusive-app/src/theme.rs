@@ -205,6 +205,60 @@ pub mod spacing {
     pub const XXXL: f32 = 48.0;
 }
 
+/// Reading measures — how wide a block of prose or a label/value form may grow
+/// before it stops being readable (`DESIGN_SYSTEM.md` §5).
+///
+/// A card that fills the viewport is fine for a chromatogram and wrong for a
+/// form. On a 4K monitor a full-width card is ~3800 px, and a field whose label
+/// sits at the left edge and whose value sits at the right edge puts twelve
+/// pixels of meaning two feet apart: the eye has nothing to track along, so the
+/// row stops reading as a pair. Capping the *content* width and centring the
+/// remainder is the fix.
+pub mod measure {
+    /// Widest a label/value form may grow. Around 800 px is the conventional
+    /// upper end of a comfortable measure for 14 px body text.
+    pub const FORM_MAX: f32 = 800.0;
+
+    /// Narrowest a form may be squeezed to and still hold its widest content —
+    /// for the calibration panel that is the standard/MW/Ve point table. Below
+    /// this width the form takes the whole window instead of being capped, so a
+    /// small window degrades to full width rather than to a squeezed column.
+    pub const FORM_MIN: f32 = 480.0;
+
+    // A cap tighter than the usability floor would make the cap the bug.
+    const _: () = assert!(FORM_MAX > FORM_MIN);
+
+    /// Width reserved for the label side of a [`crate::widgets::panels::field`]
+    /// row. Fixed rather than measured so every field in the app aligns on the
+    /// same x, and so the column does not jitter as values change.
+    pub const FIELD_LABEL: f32 = 168.0;
+
+    /// Content width for a form, given the width its container offers.
+    ///
+    /// Width is the safe axis to constrain: unlike height it cannot feed back
+    /// into a parent's size (see `widgets::chromatogram::data_y_range` for the
+    /// loop this avoids). Never let a measured content *height* reach this.
+    pub fn content_width(available: f32) -> f32 {
+        if !available.is_finite() || available <= 0.0 {
+            return 0.0;
+        }
+        available.min(FORM_MAX)
+    }
+
+    /// Space to insert ahead of the content so it sits centred in `available`.
+    ///
+    /// Centring rather than pinning left matters because the cap is visible: a
+    /// left-pinned 800 px card on a 4K window reads as a rendering failure.
+    pub fn leading_pad(available: f32) -> f32 {
+        // Guarded before the subtraction, not after: an infinite `available`
+        // would otherwise survive `max` as an infinite gutter.
+        if !available.is_finite() {
+            return 0.0;
+        }
+        ((available - content_width(available)) * 0.5).max(0.0)
+    }
+}
+
 pub mod radius {
     pub const SM: f32 = 4.0;
     pub const MD: f32 = 8.0;
@@ -462,6 +516,57 @@ mod tests {
             chart::legend_color_or_series(Some(legible), color::WHITE, 3),
             legible
         );
+    }
+
+    #[test]
+    fn a_form_is_capped_on_a_wide_window_and_left_alone_on_a_narrow_one() {
+        // The bug this exists to prevent: a 4K viewport stretching a field row.
+        assert_eq!(measure::content_width(3840.0), measure::FORM_MAX);
+        assert_eq!(
+            measure::content_width(measure::FORM_MAX + 1.0),
+            measure::FORM_MAX
+        );
+        // Below the cap the form keeps every pixel it is offered.
+        assert_eq!(measure::content_width(640.0), 640.0);
+        assert_eq!(measure::content_width(measure::FORM_MAX), measure::FORM_MAX);
+    }
+
+    #[test]
+    fn a_window_narrower_than_the_usability_floor_still_gets_all_of_it() {
+        // Degrade to full width rather than to a column too tight for the
+        // calibration point table.
+        for available in [1.0, 120.0, measure::FORM_MIN - 1.0, measure::FORM_MIN] {
+            assert_eq!(measure::content_width(available), available);
+            assert_eq!(measure::leading_pad(available), 0.0);
+        }
+    }
+
+    #[test]
+    fn a_degenerate_width_produces_no_width_rather_than_a_negative_or_a_nan() {
+        // egui hands out a zero or slightly negative available width during the
+        // first frame of a collapsed panel; that must not become a NaN layout.
+        for available in [0.0, -1.0, -4000.0, f32::NAN, f32::INFINITY] {
+            let w = measure::content_width(available);
+            assert!(
+                w.is_finite() && w >= 0.0,
+                "content_width({available}) = {w}"
+            );
+            let pad = measure::leading_pad(available);
+            assert!(
+                pad.is_finite() && pad >= 0.0,
+                "leading_pad({available}) = {pad}"
+            );
+        }
+        assert_eq!(measure::content_width(f32::INFINITY), 0.0);
+    }
+
+    #[test]
+    fn the_capped_form_is_centred_in_what_is_left() {
+        let available = 3840.0;
+        let pad = measure::leading_pad(available);
+        assert_eq!(pad, (available - measure::FORM_MAX) / 2.0);
+        // Content plus both gutters accounts for the whole width.
+        assert_eq!(pad * 2.0 + measure::content_width(available), available);
     }
 
     #[test]

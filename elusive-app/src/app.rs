@@ -6,7 +6,7 @@
 //! top, HEP96 plate below, hover in either direction.
 
 use crate::egui_adapter::{self as adapt, c, Mode};
-use crate::theme::{color, spacing, Theme};
+use crate::theme::{color, measure, spacing, Theme};
 use crate::view::{BaselineChoice, Interaction, Section, View};
 use crate::widgets::{chromatogram, panels, plate};
 use elusive_core::integrate::{integrate_peak, PlateMetric};
@@ -466,13 +466,18 @@ impl EluSiveApp {
                         }
                     }
                     Section::Calibration => {
-                        adapt::card(t).show(ui, |ui| {
-                            egui::ScrollArea::vertical()
-                                .id_salt("calibration-scroll")
-                                .show(ui, |ui| {
-                                    panels::calibration_panel(ui, run, view, t);
+                        // The scroll area owns the vertical axis; the card sits
+                        // inside it so it hugs its content instead of stretching
+                        // to the viewport on both axes.
+                        egui::ScrollArea::vertical()
+                            .id_salt("calibration-scroll")
+                            .show(ui, |ui| {
+                                measured_form(ui, |ui| {
+                                    adapt::card(t).show(ui, |ui| {
+                                        panels::calibration_panel(ui, run, view, t);
+                                    });
                                 });
-                        });
+                            });
                     }
                     Section::Results => {
                         adapt::card(t).show(ui, |ui| {
@@ -537,6 +542,38 @@ fn mark(ui: &mut egui::Ui, t: Theme) {
     }
     points.push(egui::pos2(rect.right(), base));
     painter.add(egui::Shape::line(points, stroke));
+}
+
+/// Run `contents` in a column no wider than a comfortable reading measure,
+/// centred in whatever the parent offers.
+///
+/// Only the width is constrained. The inner column's *height* is never measured
+/// back out to the caller, so this cannot start the auto-bounds feedback loop
+/// that `widgets::chromatogram::data_y_range` documents.
+fn measured_form<R>(ui: &mut egui::Ui, contents: impl FnOnce(&mut egui::Ui) -> R) -> Option<R> {
+    let available = ui.available_width();
+    let width = measure::content_width(available);
+    if width <= 0.0 {
+        return None;
+    }
+    let pad = measure::leading_pad(available);
+    let inner = ui
+        .horizontal(|ui| {
+            ui.add_space(pad);
+            ui.allocate_ui_with_layout(
+                egui::vec2(width, 0.0),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    // Otherwise the column collapses onto its widest child and
+                    // the card's right edge wanders with the content.
+                    ui.set_min_width(width);
+                    contents(ui)
+                },
+            )
+            .inner
+        })
+        .inner;
+    Some(inner)
 }
 
 fn overview(ui: &mut egui::Ui, run: &Run, view: &mut View, t: Theme) {
