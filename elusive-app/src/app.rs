@@ -26,6 +26,8 @@ pub struct EluSiveApp {
     /// Fonts the design system asked for that were not found on disk.
     missing_fonts: Vec<String>,
     styled: bool,
+    /// A run named on the command line, opened on the first frame.
+    pending_open: Option<std::path::PathBuf>,
 }
 
 impl EluSiveApp {
@@ -44,7 +46,16 @@ impl EluSiveApp {
             error: None,
             missing_fonts,
             styled: true,
+            pending_open: None,
         }
+    }
+
+    /// Open a run given on the command line, before the first frame.
+    ///
+    /// Status messages are timestamped against the egui clock, which has not
+    /// started yet, so this defers its message to the first update instead.
+    pub fn open_at_startup(&mut self, path: &std::path::Path) {
+        self.pending_open = Some(path.to_path_buf());
     }
 
     fn note(&mut self, ctx: &egui::Context, message: impl Into<String>) {
@@ -558,7 +569,8 @@ fn overview(ui: &mut egui::Ui, run: &Run, view: &mut View, t: Theme) {
 
 /// The single linked pane: chromatogram above, plate below, detail rail right.
 fn linked_pane(ui: &mut egui::Ui, run: &Run, view: &mut View, t: Theme) -> Option<Interaction> {
-    let mut interaction = None;
+    let mut outcome = chromatogram::ChartOutcome::default();
+    let mut plate_hover = None;
 
     egui::Panel::right("detail-rail")
         .exact_size(300.0)
@@ -576,9 +588,18 @@ fn linked_pane(ui: &mut egui::Ui, run: &Run, view: &mut View, t: Theme) -> Optio
                 });
         });
 
-    egui::Panel::bottom("plate-pane")
+    egui::Panel::bottom(plate::PANE_ID)
         .resizable(true)
-        .default_size(280.0)
+        // The plate reports the height it needs; the pane's only job is to keep
+        // that inside bounds which leave the chromatogram the larger share.
+        .default_size(plate::natural_pane_height(ui.available_width()))
+        // A belt-and-braces cap. The content no longer sizes itself from the
+        // available height, but a panel that can grow without limit is one bug
+        // away from hiding the chromatogram entirely.
+        .size_range(egui::Rangef::new(
+            plate::MIN_PANE_HEIGHT,
+            plate::MAX_PANE_HEIGHT,
+        ))
         .frame(adapt::card(t))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -619,19 +640,9 @@ fn linked_pane(ui: &mut egui::Ui, run: &Run, view: &mut View, t: Theme) -> Optio
                 });
             });
 
-            // The plate reports which well is hovered; that feeds the trace
-            // highlight on the next frame, closing the two-way link.
-            let hovered = plate::show(ui, run, view, t);
-            if let Some(well) = hovered {
-                view.hovered_well = Some(well);
-                view.hovered_vol_range = run
-                    .fractions
-                    .iter()
-                    .find(|f| f.well == Some(well))
-                    .map(|f| f.volume_window());
-            } else if view.hovered_volume.is_none() {
-                view.hovered_well = None;
-            }
+            // The plate only *reports* what it hovered; the shared state is
+            // written once, below, after both panes have had their say.
+            plate_hover = plate::show(ui, run, view, t);
         });
 
     // Peak table under the chart when the user is working on peaks.
@@ -639,6 +650,7 @@ fn linked_pane(ui: &mut egui::Ui, run: &Run, view: &mut View, t: Theme) -> Optio
         egui::Panel::bottom("peak-pane")
             .resizable(true)
             .default_size(180.0)
+            .size_range(egui::Rangef::new(90.0, 360.0))
             .frame(adapt::card(t))
             .show(ui, |ui| {
                 panels::heading(ui, t, "Integrations");
@@ -649,10 +661,56 @@ fn linked_pane(ui: &mut egui::Ui, run: &Run, view: &mut View, t: Theme) -> Optio
     egui::CentralPanel::default()
         .frame(adapt::card(t))
         .show(ui, |ui| {
-            interaction = chromatogram::show(ui, run, view, t);
+            outcome = chromatogram::show(ui, run, view, t);
         });
 
-    interaction
+    resolve_hover(ui.ctx(), run, view, plate_hover, outcome.hovered_volume);
+    outcome.interaction
+}
+
+/// Decide the frame's hover state from what each pane reported.
+///
+/// Single-writer on purpose. Previously the plate and every stacked plot each
+/// assigned `view.hovered_*` as they drew, so whichever ran last won and the
+/// highlight flickered or never appeared. The plate takes precedence because the
+/// pointer can only be over one of the two panes, and the plate is the more
+/// specific target.
+fn resolve_hover(
+    ctx: &egui::Context,
+    run: &Run,
+    view: &mut View,
+    plate_hover: Option<elusive_core::model::Well>,
+    hovered_volume: Option<f32>,
+) {
+    let (well, range) = match (plate_hover, hovered_volume) {
+        (Some(well), _) => (
+            Some(well),
+            run.fractions
+                .iter()
+                .find(|f| f.well == Some(well))
+                .map(|f| f.volume_window()),
+        ),
+        (None, Some(v)) => {
+            let fraction = run.fractions.iter().find(|f| {
+                let (a, b) = f.volume_window();
+                v >= a && v <= b
+            });
+            (
+                fraction.and_then(|f| f.well),
+                fraction.map(|f| f.volume_window()),
+            )
+        }
+        (None, None) => (None, None),
+    };
+
+    // The panes drew using last frame's answer, so a change needs one more frame
+    // to appear. Ask for it rather than waiting for the next unrelated event.
+    if view.hovered_well != well || view.hovered_vol_range != range {
+        ctx.request_repaint();
+    }
+    view.hovered_well = well;
+    view.hovered_vol_range = range;
+    view.hovered_volume = hovered_volume;
 }
 
 fn reports(ui: &mut egui::Ui, run: &Run, view: &mut View, t: Theme) {
@@ -714,6 +772,18 @@ fn reports(ui: &mut egui::Ui, run: &Run, view: &mut View, t: Theme) {
 }
 
 impl eframe::App for EluSiveApp {
+    /// Do not carry egui's memory across runs.
+    ///
+    /// eframe persists panel sizes by default, which means a layout saved by an
+    /// older build is restored on top of a newer one — a user who ran a version
+    /// with an oversized plate pane would keep it even after upgrading. Starting
+    /// from the declared defaults every launch makes the layout a property of the
+    /// build, not of whatever state happens to be on disk. View preferences that
+    /// are worth keeping live in the run's sidecar, deliberately.
+    fn persist_egui_memory(&self) -> bool {
+        false
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
@@ -721,6 +791,10 @@ impl eframe::App for EluSiveApp {
             self.theme = self.mode.resolve(ctx);
             adapt::apply(ctx, self.theme);
             self.styled = true;
+        }
+
+        if let Some(path) = self.pending_open.take() {
+            self.open_path(ctx, &path);
         }
 
         // Accept a run dropped onto the window — the fastest path from USB stick

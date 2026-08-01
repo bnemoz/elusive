@@ -21,7 +21,19 @@ const MIN_GROUP_HEIGHT: f32 = 90.0;
 /// raw trace stays dominant (rule #2).
 const FRACTION_TICK_SHARE: f64 = 0.06;
 
-pub fn show(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) -> Option<Interaction> {
+/// What the chromatogram pane observed this frame.
+///
+/// The pane *reports* rather than writes: several plots are stacked, and if each
+/// one set the shared hover state directly the last would clear what the first
+/// found. The caller resolves one answer per frame (see `app::linked_pane`).
+#[derive(Clone, Debug, Default)]
+pub struct ChartOutcome {
+    pub interaction: Option<Interaction>,
+    /// Elution volume under the pointer, when it is over one of the plots.
+    pub hovered_volume: Option<f32>,
+}
+
+pub fn show(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) -> ChartOutcome {
     let groups = visible_groups(run, view);
     if groups.is_empty() {
         ui.centered_and_justified(|ui| {
@@ -30,19 +42,25 @@ pub fn show(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) -> Option<Interac
                     .color(c(t.text_secondary)),
             );
         });
-        return None;
+        return ChartOutcome::default();
     }
 
-    let mut interaction = None;
+    let mut outcome = ChartOutcome::default();
     let total = ui.available_height();
     let heights = group_heights(&groups, total);
 
     for (idx, (group, height)) in groups.iter().zip(heights).enumerate() {
-        if let Some(action) = plot_group(ui, run, view, t, *group, height, idx == 0) {
-            interaction = Some(action);
+        let (interaction, hovered) = plot_group(ui, run, view, t, *group, height, idx == 0);
+        if interaction.is_some() {
+            outcome.interaction = interaction;
+        }
+        // Only the plot actually under the pointer reports a volume, so a later
+        // plot in the stack cannot erase an earlier one's hover.
+        if hovered.is_some() {
+            outcome.hovered_volume = hovered;
         }
     }
-    interaction
+    outcome
 }
 
 /// Axis groups that currently have at least one visible channel, hero group first.
@@ -64,15 +82,54 @@ fn visible_groups(run: &Run, view: &View) -> Vec<AxisGroup> {
     groups
 }
 
+/// Split the pane between axis groups.
+///
+/// The result always sums to at most `total`. Handing back more than we were
+/// given would overflow the parent, and a parent that grows to fit its content is
+/// exactly the feedback loop this module has to avoid.
 fn group_heights(groups: &[AxisGroup], total: f32) -> Vec<f32> {
-    if groups.len() == 1 {
+    let n = groups.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let total = total.max(0.0);
+    if n == 1 {
         return vec![total];
     }
-    let hero = (total * HERO_HEIGHT_SHARE).max(MIN_GROUP_HEIGHT);
-    let rest = ((total - hero) / (groups.len() - 1) as f32).max(MIN_GROUP_HEIGHT);
+    // Too tight for everyone to get the minimum: split evenly and accept that
+    // the plots are small, rather than overflowing.
+    if total <= MIN_GROUP_HEIGHT * n as f32 {
+        return vec![total / n as f32; n];
+    }
+    let hero = (total * HERO_HEIGHT_SHARE)
+        .clamp(MIN_GROUP_HEIGHT, total - MIN_GROUP_HEIGHT * (n - 1) as f32);
+    let rest = (total - hero) / (n - 1) as f32;
     std::iter::once(hero)
-        .chain(std::iter::repeat_n(rest, groups.len() - 1))
+        .chain(std::iter::repeat_n(rest, n - 1))
         .collect()
+}
+
+/// The y-extent of the data in an axis group, in display units.
+///
+/// Overlays are drawn against *this*, never against `plot_ui.plot_bounds()`.
+/// egui_plot recomputes auto-bounds from its items each frame and adds a 5%
+/// margin, so an overlay sized from the current bounds re-enters the next frame's
+/// bounds and inflates them compounding — the plot silently zooms out a little on
+/// every repaint. Deriving from the data keeps overlays inside the bounds they
+/// help produce, so the scale is stable.
+fn data_y_range(channels: &[(usize, &Channel)]) -> (f64, f64) {
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+    for (_, channel) in channels {
+        if let Some((clo, chi)) = channel.display_value_range() {
+            lo = lo.min(clo as f64);
+            hi = hi.max(chi as f64);
+        }
+    }
+    if !lo.is_finite() || !hi.is_finite() || hi <= lo {
+        return (0.0, 1.0);
+    }
+    (lo, hi)
 }
 
 fn plot_group(
@@ -83,7 +140,7 @@ fn plot_group(
     group: AxisGroup,
     height: f32,
     is_hero: bool,
-) -> Option<Interaction> {
+) -> (Option<Interaction>, Option<f32>) {
     let channels: Vec<(usize, &Channel)> = run
         .channels
         .iter()
@@ -93,7 +150,7 @@ fn plot_group(
         })
         .collect();
     if channels.is_empty() {
-        return None;
+        return (None, None);
     }
 
     let unit = channels
@@ -105,13 +162,19 @@ fn plot_group(
     let integrating = view.integrate_mode;
 
     let mut interaction = None;
-    let response = Plot::new(format!("chromatogram-{group:?}"))
+    let mut hovered_volume = None;
+    Plot::new(format!("chromatogram-{group:?}"))
         .height(height)
         .link_axis("chromatogram-x", [true, false])
         .allow_drag([!integrating, !integrating])
         .allow_boxed_zoom(!integrating)
         .show_grid([true, true])
-        .y_axis_label(format!("{} ({unit})", group.label()))
+        .custom_y_axes(vec![egui_plot::AxisHints::new_y()
+            .label(format!("{} ({unit})", group.label()))
+            // Defaults to 20..30 pt, which blanks every tick label on a short
+            // plot — unreadable peak heights on the one trace that matters.
+            .label_spacing(egui::Rangef::new(12.0, 20.0))
+            .min_thickness(44.0)])
         .x_axis_label(if is_hero { "" } else { "Elution volume (mL)" })
         .legend(egui_plot::Legend::default().position(egui_plot::Corner::RightTop))
         .label_formatter(|pos| {
@@ -122,8 +185,9 @@ fn plot_group(
             Some(format!("{:.3} mL\n{:.3}", p.x, p.y))
         })
         .show(ui, |plot_ui| {
-            let bounds = plot_ui.plot_bounds();
-            let (y_lo, y_hi) = (bounds.min()[1], bounds.max()[1]);
+            // Fixed, data-derived extent. Deliberately NOT `plot_ui.plot_bounds()`
+            // — see `data_y_range`.
+            let (y_lo, y_hi) = data_y_range(&channels);
             let y_span = (y_hi - y_lo).max(f64::MIN_POSITIVE);
 
             // 1. Fraction bands sit *under* the traces so the signal stays on top.
@@ -146,7 +210,7 @@ fn plot_group(
                 let fill = c_alpha(chart::SELECTION_STROKE, 40);
                 plot_ui.polygon(
                     Polygon::new(
-                        "selection",
+                        "",
                         PlotPoints::from(vec![
                             [a as f64, y_lo],
                             [b as f64, y_lo],
@@ -166,33 +230,8 @@ fn plot_group(
             let response = plot_ui.response();
             let pointer = plot_ui.pointer_coordinate();
 
-            if let Some(p) = pointer {
-                let v = p.x as f32;
-                view.hovered_volume = Some(v);
-                // Hovering the trace highlights the fraction under the cursor,
-                // which is the other half of the plate↔chart link.
-                view.hovered_vol_range = run
-                    .fractions
-                    .iter()
-                    .find(|f| {
-                        let (a, b) = f.volume_window();
-                        v >= a && v <= b
-                    })
-                    .map(|f| f.volume_window());
-                if view.hovered_vol_range.is_none() {
-                    view.hovered_well = None;
-                } else {
-                    view.hovered_well = run
-                        .fractions
-                        .iter()
-                        .find(|f| {
-                            let (a, b) = f.volume_window();
-                            v >= a && v <= b
-                        })
-                        .and_then(|f| f.well);
-                }
-            } else if !response.hovered() {
-                view.hovered_volume = None;
+            if response.hovered() {
+                hovered_volume = pointer.map(|p| p.x as f32);
             }
 
             if integrating {
@@ -213,17 +252,9 @@ fn plot_group(
                     view.drag_anchor = None;
                 }
             }
-        })
-        .response;
+        });
 
-    if !response.hovered() && view.pending_selection.is_none() {
-        // Leaving the plot clears the link so a stale band does not linger.
-        if view.hovered_well.is_none() {
-            view.hovered_vol_range = None;
-        }
-    }
-
-    interaction
+    (interaction, hovered_volume)
 }
 
 fn draw_channel(
@@ -326,7 +357,7 @@ fn draw_highlighted_span(
     };
     plot_ui.polygon(
         Polygon::new(
-            "fraction",
+            "",
             PlotPoints::from(vec![
                 [a as f64, y_lo],
                 [b as f64, y_lo],
@@ -354,7 +385,7 @@ fn draw_excluded_regions(
         let (a, b) = (region.v_start_ml as f64, region.v_end_ml as f64);
         plot_ui.polygon(
             Polygon::new(
-                "excluded",
+                "",
                 PlotPoints::from(vec![[a, y_lo], [b, y_lo], [b, y_hi], [a, y_hi]]),
             )
             .fill_color(ca(color::EXCLUDED_REGION))
@@ -401,7 +432,7 @@ fn draw_peak_regions(
             color::INTEGRATED_AREA.a
         };
         plot_ui.polygon(
-            Polygon::new(peak.id.to_string(), PlotPoints::from(outline))
+            Polygon::new("", PlotPoints::from(outline))
                 .fill_color(c_alpha(
                     crate::theme::Rgb::new(
                         color::INTEGRATED_AREA.r,
@@ -527,5 +558,69 @@ pub fn legend(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) {
                 .color(c(t.text_secondary)),
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GROUPS: [AxisGroup; 3] = [AxisGroup::Uv, AxisGroup::Conductivity, AxisGroup::Ph];
+
+    #[test]
+    fn group_heights_never_exceed_the_space_available() {
+        // Overflowing the parent is what lets a panel grow, so this is the
+        // invariant that keeps the chromatogram pane stable.
+        for total in [0.0f32, 40.0, 120.0, 300.0, 900.0, 2000.0] {
+            for n in 1..=GROUPS.len() {
+                let heights = group_heights(&GROUPS[..n], total);
+                assert_eq!(heights.len(), n);
+                let sum: f32 = heights.iter().sum();
+                assert!(sum <= total + 1e-3, "n={n} total={total} sum={sum}");
+                assert!(heights.iter().all(|h| *h >= 0.0));
+            }
+        }
+    }
+
+    #[test]
+    fn the_hero_group_gets_the_most_height_when_there_is_room() {
+        let heights = group_heights(&GROUPS, 900.0);
+        assert!(heights[0] > heights[1]);
+        assert!(heights[0] > heights[2]);
+    }
+
+    #[test]
+    fn a_cramped_pane_splits_evenly_rather_than_overflowing() {
+        let heights = group_heights(&GROUPS, 120.0);
+        let sum: f32 = heights.iter().sum();
+        assert!((sum - 120.0).abs() < 1e-3, "sum = {sum}");
+        assert!(heights.windows(2).all(|w| (w[0] - w[1]).abs() < 1e-3));
+    }
+
+    #[test]
+    fn overlay_extent_comes_from_the_data_not_the_view() {
+        use elusive_core::model::{Channel, ChannelKind, Sample};
+
+        let mut uv = Channel::new("MWave2", "UV 280 nm", ChannelKind::Uv);
+        uv.display_scale = 1000.0;
+        uv.samples = vec![
+            Sample::new(0.0, 0.0, 0.0),
+            Sample::new(60.0, 1.0, 0.5),
+            Sample::new(120.0, 2.0, 0.25),
+        ];
+        let channels = vec![(0usize, &uv)];
+        let (lo, hi) = data_y_range(&channels);
+
+        // Display units: 0..500 mAU. If this ever tracked the plot's current
+        // bounds instead, overlays would re-enter auto-bounds and the y-scale
+        // would inflate on every repaint.
+        assert!((lo - 0.0).abs() < 1e-6, "lo = {lo}");
+        assert!((hi - 500.0).abs() < 1e-6, "hi = {hi}");
+    }
+
+    #[test]
+    fn an_empty_group_still_yields_a_usable_extent() {
+        let (lo, hi) = data_y_range(&[]);
+        assert!(hi > lo, "a degenerate range would make overlays invisible");
     }
 }

@@ -102,12 +102,145 @@ pub fn show(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) -> Option<Well> {
 
     let mut hovered = None;
 
-    // Size cells to fill the available area while staying square-ish.
-    let avail = ui.available_size();
-    let label_gutter = 22.0;
-    let cell_w = ((avail.x - label_gutter) / geometry.cols as f32 - spacing::XS).max(18.0);
-    let cell_h = ((avail.y - label_gutter) / geometry.rows as f32 - spacing::XS).max(16.0);
-    let cell = egui::vec2(cell_w, cell_h);
+    let label_gutter = LABEL_GUTTER;
+    let cell = cell_size(ui.available_width(), geometry);
+
+    // Scroll only when the user has dragged the pane below the plate's natural
+    // height. The cap comes from the pane's stored size rather than
+    // `available_height`, which reports the panel's *maximum*. Note it feeds
+    // scrolling only, never `cell` — that independence is what keeps the pane
+    // from creeping open a few pixels per frame.
+    let used_above = (ui.cursor().top() - ui.max_rect().top()).max(0.0);
+    let cap =
+        (pane_height(ui) - CARD_MARGINS - used_above - LEGEND_HEIGHT).max(2.0 * MIN_CELL_HEIGHT);
+
+    egui::ScrollArea::vertical()
+        .id_salt("plate-grid")
+        .max_height(cap)
+        .show(ui, |ui| {
+            hovered = plate_grid(
+                ui,
+                &cells,
+                range,
+                ramp,
+                cell,
+                label_gutter,
+                geometry,
+                view,
+                t,
+            );
+        });
+
+    if let Some((lo, hi)) = range {
+        legend(ui, run, view, t, lo, hi, ramp);
+    }
+
+    hovered
+}
+
+/// Width reserved for the row letters / column numbers.
+const LABEL_GUTTER: f32 = 22.0;
+/// Smallest cell that still fits a two-character well label.
+const MIN_CELL_WIDTH: f32 = 20.0;
+/// Beyond this the plate stops looking like a plate and starts wasting space.
+const MAX_CELL_WIDTH: f32 = 56.0;
+const MIN_CELL_HEIGHT: f32 = 16.0;
+/// Tall enough to show a label and a value, small enough that eight rows fit
+/// a pane that still leaves the chromatogram the larger share.
+const MAX_CELL_HEIGHT: f32 = 30.0;
+/// Wells render slightly wider than tall, matching a real HEP96 footprint.
+const CELL_ASPECT: f32 = 0.72;
+/// Cell height at which a well can show its value as well as its label.
+const VALUE_TEXT_MIN_HEIGHT: f32 = 26.0;
+/// Smallest useful pane: two rows of wells plus the legend.
+pub const MIN_PANE_HEIGHT: f32 = 220.0;
+/// The plate must never be able to crowd out the chromatogram (design.md §11).
+pub const MAX_PANE_HEIGHT: f32 = 470.0;
+/// Id of the pane, shared with `app::linked_pane` so its size can be read back.
+pub const PANE_ID: &str = "plate-pane";
+/// Height the legend row adds below the grid.
+const LEGEND_HEIGHT: f32 = 50.0;
+/// Room the heading row (title plus the channel/metric pickers) takes.
+const HEADING_HEIGHT: f32 = 48.0;
+/// The card frame's inner margin, top and bottom.
+const CARD_MARGINS: f32 = 2.0 * spacing::LG;
+
+/// Height the well grid needs at a given cell size, excluding the legend.
+///
+/// Exact, not approximate: `plate_grid` zeroes the ambient item spacing and adds
+/// its own, so this model and the rendered result agree to the pixel. They have
+/// to — the pane height is chosen from this number.
+fn grid_height(cell_height: f32, geometry: RackGeometry) -> f32 {
+    LABEL_GUTTER + geometry.rows as f32 * (cell_height + spacing::XS)
+}
+
+/// The plate's natural height: what it asks the pane for.
+///
+/// Intrinsic on purpose. Earlier versions derived the cell height from the pane
+/// and let the pane derive its height from the content, which is circular — the
+/// pane crept a few pixels open every frame until it reached its ceiling and
+/// squeezed the chromatogram out. Making the content's height independent of the
+/// pane removes the cycle rather than trying to balance it.
+pub fn natural_height(available_width: f32, geometry: RackGeometry) -> f32 {
+    let cell = cell_size(available_width, geometry);
+    CARD_MARGINS + HEADING_HEIGHT + grid_height(cell.y, geometry) + LEGEND_HEIGHT
+}
+
+/// Height the pane should open at, given the width it will have.
+///
+/// `app::linked_pane` asks for this rather than passing a constant, so the pane
+/// opens at exactly the size the plate needs and there is no number to keep in
+/// sync by hand.
+pub fn natural_pane_height(available_width: f32) -> f32 {
+    natural_height(available_width, RackGeometry::HEP96).clamp(MIN_PANE_HEIGHT, MAX_PANE_HEIGHT)
+}
+
+/// The pane's height as of last frame, clamped to what the panel permits.
+///
+/// Reading the stored size is safe where reading `ui.available_height()` was not:
+/// the content below is built to occupy exactly this height, so the value is a
+/// fixed point — it only changes when the user drags the splitter. Available
+/// height, by contrast, reports the panel's *maximum*, so sizing from it made the
+/// plate expand to its ceiling every frame.
+fn pane_height(ui: &Ui) -> f32 {
+    egui::PanelState::load(ui.ctx(), egui::Id::new(PANE_ID))
+        .map(|state| state.size().y)
+        .unwrap_or(MAX_PANE_HEIGHT)
+        .clamp(MIN_PANE_HEIGHT, MAX_PANE_HEIGHT)
+}
+
+/// Cell size for a given pane width.
+///
+/// Width in, size out. The height comes from the *constant* pane budget, never
+/// from `ui.available_height()` — inside an `egui::Panel` that reports space up
+/// to `size_range.max`, so sizing from it makes the plate expand to its own
+/// ceiling and squeeze the chromatogram out. Constants cannot feed back.
+fn cell_size(available_width: f32, geometry: RackGeometry) -> egui::Vec2 {
+    let cols = geometry.cols.max(1) as f32;
+    let w = ((available_width - LABEL_GUTTER) / cols - spacing::XS)
+        .clamp(MIN_CELL_WIDTH, MAX_CELL_WIDTH);
+    let h = (w * CELL_ASPECT).clamp(MIN_CELL_HEIGHT, MAX_CELL_HEIGHT);
+    egui::vec2(w, h)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plate_grid(
+    ui: &mut Ui,
+    cells: &[WellCell],
+    range: Option<(f64, f64)>,
+    ramp: &[Rgb],
+    cell: egui::Vec2,
+    label_gutter: f32,
+    geometry: RackGeometry,
+    view: &View,
+    t: Theme,
+) -> Option<Well> {
+    let mut hovered = None;
+
+    // Own the spacing outright: the ambient 8 px between rows would put the
+    // rendered grid ~64 px past what `grid_height` predicts, and the pane height
+    // is derived from that prediction.
+    ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
 
     ui.horizontal(|ui| {
         ui.add_space(label_gutter);
@@ -147,10 +280,6 @@ pub fn show(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) -> Option<Well> {
             }
         });
         ui.add_space(spacing::XS);
-    }
-
-    if let Some((lo, hi)) = range {
-        legend(ui, run, view, t, lo, hi, ramp);
     }
 
     hovered
@@ -232,7 +361,7 @@ fn draw_well(
                 &label,
                 label_style,
             );
-            if rect.height() >= 30.0 && !value_text.is_empty() {
+            if rect.height() >= VALUE_TEXT_MIN_HEIGHT && !value_text.is_empty() {
                 haloed_text(
                     painter,
                     rect.right_bottom() - egui::vec2(3.0, 2.0),
@@ -408,6 +537,7 @@ pub fn export_rows(run: &Run, view: &View) -> Vec<(Well, String, PlateMetric, Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use elusive_core::model::{Channel, ChannelKind, RunMeta, Sample, SourceFormat};
 
     fn run_with_fractions() -> Run {
@@ -511,6 +641,106 @@ mod tests {
         assert_eq!(rows.len(), 4);
         assert_eq!(rows[0].1, "MWave2");
         assert_eq!(rows[0].2, PlateMetric::MaxValue);
+    }
+
+    #[test]
+    fn cell_size_never_grows_without_bound() {
+        // The runaway this guards against: a plate that keeps getting bigger
+        // until it hides the chromatogram.
+        for width in [0.0f32, 120.0, 640.0, 1920.0, 10_000.0] {
+            let cell = cell_size(width, RackGeometry::HEP96);
+            assert!(
+                (MIN_CELL_WIDTH..=MAX_CELL_WIDTH).contains(&cell.x),
+                "width {width} gave cell width {}",
+                cell.x
+            );
+            assert!(
+                (MIN_CELL_HEIGHT..=MAX_CELL_HEIGHT).contains(&cell.y),
+                "width {width} gave cell height {}",
+                cell.y
+            );
+        }
+    }
+
+    #[test]
+    fn the_plate_asks_for_a_height_the_pane_can_actually_give() {
+        // The v0.1 bug was the plate growing until it hid the chromatogram. The
+        // plate's height is now intrinsic, so the only thing to check is that
+        // what it asks for fits inside the ceiling the panel enforces.
+        for width in [640.0f32, 1000.0, 1440.0, 1920.0, 3840.0] {
+            let natural = natural_height(width, RackGeometry::HEP96);
+            assert!(
+                natural <= MAX_PANE_HEIGHT,
+                "width {width}: plate wants {natural} px, ceiling is {MAX_PANE_HEIGHT}"
+            );
+            assert!(
+                natural >= MIN_PANE_HEIGHT,
+                "width {width}: {natural} px is too short"
+            );
+        }
+    }
+
+    #[test]
+    fn the_plate_height_does_not_depend_on_the_space_offered() {
+        // There is no pane argument to depend on — that is the point. This test
+        // exists so a future refactor cannot quietly reintroduce one.
+        let a = natural_height(1440.0, RackGeometry::HEP96);
+        let b = natural_height(1440.0, RackGeometry::HEP96);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn cell_size_is_a_pure_function_of_width() {
+        // Same width, same answer — the plate's height can never influence it,
+        // which is what breaks the panel/content feedback loop.
+        assert_eq!(
+            cell_size(900.0, RackGeometry::HEP96),
+            cell_size(900.0, RackGeometry::HEP96)
+        );
+        assert!(cell_size(1400.0, RackGeometry::HEP96).x > cell_size(400.0, RackGeometry::HEP96).x);
+    }
+
+    #[test]
+    fn the_plate_leaves_the_chromatogram_the_larger_share() {
+        // design.md §11: chromatogram on top with most of the height. The plate
+        // taking the window was the v0.1 bug; this pins the intent numerically.
+        let typical_content_height = 900.0f32;
+        for width in [700.0f32, 1440.0, 2560.0] {
+            let pane = natural_pane_height(width);
+            assert!(
+                pane < typical_content_height - pane,
+                "width {width}: plate pane {pane} would out-size the chart pane"
+            );
+        }
+    }
+
+    #[test]
+    fn a_full_plate_fits_the_pane_it_opens_at() {
+        // Scrolling is a safety net for a user who drags the splitter small, not
+        // the normal way to read a plate: at any realistic width the pane must
+        // open large enough for all 96 wells.
+        for width in [700.0f32, 1000.0, 1440.0, 2560.0, 3840.0] {
+            let natural = natural_height(width, RackGeometry::HEP96);
+            let pane = natural_pane_height(width);
+            assert!(
+                natural <= pane + 0.5,
+                "width {width}: plate needs {natural} px, pane opens at {pane}"
+            );
+        }
+    }
+
+    #[test]
+    fn wells_are_tall_enough_to_show_their_value() {
+        // Rule #3: colour never carries meaning alone, so the number has to fit.
+        // This is what pins MAX_CELL_HEIGHT — shrink it and the values go.
+        for width in [1000.0f32, 1280.0, 1920.0] {
+            let cell = cell_size(width, RackGeometry::HEP96);
+            assert!(
+                cell.y >= VALUE_TEXT_MIN_HEIGHT,
+                "width {width}: cell height {} hides the value",
+                cell.y
+            );
+        }
     }
 
     #[test]
