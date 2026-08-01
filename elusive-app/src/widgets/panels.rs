@@ -4,7 +4,7 @@
 //! line up by place value rather than by chance (`DESIGN_SYSTEM.md` rule #4).
 
 use crate::egui_adapter::{c, c_alpha, font_code, font_h3, font_micro, num};
-use crate::theme::{color, spacing, Theme};
+use crate::theme::{color, measure, spacing, Theme};
 use crate::view::View;
 use egui::Ui;
 use elusive_core::calibration::{self, FitBasis, BIORAD_GFS, LOW_CONFIDENCE_R2};
@@ -20,21 +20,43 @@ pub fn heading(ui: &mut Ui, t: Theme, text: &str) {
     ui.add_space(spacing::SM);
 }
 
-/// Label above a value, per §6 (labels above controls, units in the label).
+/// One row of a label/value form: label in a fixed-width left column, value
+/// immediately beside it. Units stay in the label, per §6.
+///
+/// This used to push the value to the far right with a nested right-to-left
+/// layout. In the 340 px detail rail that reads fine, which is why the bug hid
+/// for so long; in a card that fills a 4K window it separates a label from its
+/// value by most of the screen and the pair stops reading as a row.
+///
+/// A fixed column rather than an `egui::Grid`: a grid only aligns the rows
+/// inside it, and `field` is called one row at a time, interleaved with
+/// headings, warnings and drag fields. A constant keeps every field in the app
+/// on the same x, and cannot jitter as values change width between frames.
 pub fn field(ui: &mut Ui, t: Theme, label: &str, value: &str) {
     ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new(label)
-                .font(font_micro())
-                .color(c(t.text_secondary)),
+        // Never let the label eat more than half of a narrow rail.
+        let column = measure::FIELD_LABEL
+            .min(ui.available_width() * 0.5)
+            .max(0.0);
+        ui.allocate_ui_with_layout(
+            egui::vec2(column, 0.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                // `allocate_ui_with_layout` shrinks its allocation to the content,
+                // so a short label would collapse the column and break alignment.
+                ui.set_min_width(column);
+                ui.label(
+                    egui::RichText::new(label)
+                        .font(font_micro())
+                        .color(c(t.text_secondary)),
+                );
+            },
         );
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(
-                egui::RichText::new(value)
-                    .font(font_code())
-                    .color(c(t.text_primary)),
-            );
-        });
+        ui.label(
+            egui::RichText::new(value)
+                .font(font_code())
+                .color(c(t.text_primary)),
+        );
     });
 }
 

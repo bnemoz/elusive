@@ -78,6 +78,15 @@ Peak labels use `P1`, `P2`, … in 11 px semibold. Retention time remains a sepa
 - Card radius: **8 px**; large modal/splash surfaces: **12 px**.
 - Border: **1 px** `SLATE_200`; focus ring: **2 px** `BLUE_500`.
 - Use shadows sparingly. Prefer a border plus surface contrast.
+- **Measure:** a label/value form caps at **800 px** of content and centres in the
+  space left over; below **480 px** it takes the full width instead of shrinking
+  further. Data surfaces — chromatogram, plate, wide numeric tables — are exempt
+  and still use the whole viewport. A form that fills a 4K window separates a
+  label from its value by the width of the screen, and the row stops reading as
+  a pair.
+- Label/value rows put the label in a **fixed 168 px column** with the value
+  immediately beside it, never justified to the opposite edge. The fixed column
+  aligns every field in the app on one x and cannot jitter between frames.
 
 ## 6. Component rules
 
