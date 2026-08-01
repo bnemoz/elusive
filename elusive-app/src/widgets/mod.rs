@@ -2,5 +2,6 @@
 //! read-only and all mutation is funnelled through one place.
 
 pub mod chromatogram;
+pub mod overview;
 pub mod panels;
 pub mod plate;

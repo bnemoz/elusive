@@ -59,6 +59,84 @@ impl Section {
     }
 }
 
+/// A card in the Overview section, in the order the user has arranged them.
+///
+/// The Overview is the one section whose layout the user controls, so its cards
+/// need names that survive a restart. The variants are UI identity only — the
+/// core knows nothing about them, and the sidecar stores [`PanelId::as_str`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PanelId {
+    RunSummary,
+    Warnings,
+    Channels,
+    Fractions,
+}
+
+impl PanelId {
+    /// The declared default arrangement, and the order a reset returns to.
+    pub const ALL: [PanelId; 4] = [
+        PanelId::RunSummary,
+        PanelId::Warnings,
+        PanelId::Channels,
+        PanelId::Fractions,
+    ];
+
+    /// Stable serialized form. Never rename one of these without a migration:
+    /// an id this build does not recognise is dropped on load.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PanelId::RunSummary => "run_summary",
+            PanelId::Warnings => "warnings",
+            PanelId::Channels => "channels",
+            PanelId::Fractions => "fractions",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        PanelId::ALL.into_iter().find(|p| p.as_str() == s)
+    }
+}
+
+/// Move the panel at `from` to index `to`, shifting everything between.
+///
+/// Pure, because the drag-and-drop gesture that calls it cannot be exercised in
+/// a headless test but this arithmetic can. Out-of-range indices are ignored
+/// rather than clamped: a drop that does not name a real slot is not a reorder.
+/// Returns whether the order actually changed.
+pub fn reorder(order: &mut Vec<PanelId>, from: usize, to: usize) -> bool {
+    if from >= order.len() || to >= order.len() || from == to {
+        return false;
+    }
+    let panel = order.remove(from);
+    order.insert(to, panel);
+    true
+}
+
+/// Rebuild a panel order from the strings in a sidecar.
+///
+/// Tolerant in both directions on purpose. An id this build does not know is
+/// dropped (a sidecar from a future version with an extra card), and any panel
+/// the saved list never mentions is appended after the ones it does mention (a
+/// sidecar from an older version, or one that lost an id). Either way every panel
+/// this build can draw appears exactly once, so a stale file can never hide a
+/// card the user would then have no way to get back.
+pub fn restore_order(saved: &[String]) -> Vec<PanelId> {
+    let mut order: Vec<PanelId> = Vec::with_capacity(PanelId::ALL.len());
+    for id in saved {
+        if let Some(panel) = PanelId::parse(id) {
+            if !order.contains(&panel) {
+                order.push(panel);
+            }
+        }
+    }
+    for panel in PanelId::ALL {
+        if !order.contains(&panel) {
+            order.push(panel);
+        }
+    }
+    order
+}
+
 /// Which baseline the next integration will use.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum BaselineChoice {
@@ -146,6 +224,9 @@ pub struct View {
     pub hero_channel_id: Option<ChannelId>,
     pub show_fractions: bool,
 
+    /// Overview card order, left-to-right then top-to-bottom through the columns.
+    pub overview_order: Vec<PanelId>,
+
     // --- linked hover state (Phase 4) ---
     pub hovered_vol_range: Option<(f32, f32)>,
     pub hovered_well: Option<Well>,
@@ -190,6 +271,7 @@ impl Default for View {
             selected_channel: None,
             hero_channel_id: None,
             show_fractions: true,
+            overview_order: PanelId::ALL.to_vec(),
             hovered_vol_range: None,
             hovered_well: None,
             hovered_volume: None,
@@ -233,6 +315,9 @@ impl View {
         self.hovered_well = None;
         self.next_peak_id = 1;
         self.dirty = false;
+        // `overview_order` is deliberately not reset: the arrangement is a
+        // working preference, not a property of the run, so it survives opening
+        // the next file. A sidecar for that file may still override it.
 
         let hero = run.hero_channel().map(|c| c.id.clone());
         self.hero_channel_id = hero.clone();
@@ -285,6 +370,34 @@ impl View {
     pub fn set_show_fractions(&mut self, show: bool) {
         if self.show_fractions != show {
             self.show_fractions = show;
+            self.dirty = true;
+        }
+    }
+
+    /// Drop the panel `dragged` into the slot `target` currently occupies.
+    ///
+    /// Takes panels rather than indices because the drag payload is a panel and
+    /// the visible list may omit the Warnings card; resolving against
+    /// `overview_order` here keeps the hidden card's saved position intact.
+    pub fn move_overview_panel(&mut self, dragged: PanelId, target: PanelId) {
+        let (Some(from), Some(to)) = (
+            self.overview_order.iter().position(|p| *p == dragged),
+            self.overview_order.iter().position(|p| *p == target),
+        ) else {
+            return;
+        };
+        if reorder(&mut self.overview_order, from, to) {
+            self.dirty = true;
+        }
+    }
+
+    pub fn overview_order_is_default(&self) -> bool {
+        self.overview_order == PanelId::ALL
+    }
+
+    pub fn reset_overview_order(&mut self) {
+        if !self.overview_order_is_default() {
+            self.overview_order = PanelId::ALL.to_vec();
             self.dirty = true;
         }
     }
@@ -388,6 +501,12 @@ impl View {
             plate_metric: Some(self.plate_metric),
             show_fractions: Some(self.show_fractions),
             plate_uniform_ramp: Some(self.plate_uniform_ramp),
+            overview_order: Some(
+                self.overview_order
+                    .iter()
+                    .map(|p| p.as_str().to_string())
+                    .collect(),
+            ),
         };
         sidecar
     }
@@ -458,6 +577,9 @@ impl View {
         }
         if let Some(enabled) = sidecar.view.plate_uniform_ramp {
             self.plate_uniform_ramp = enabled;
+        }
+        if let Some(saved) = &sidecar.view.overview_order {
+            self.overview_order = restore_order(saved);
         }
 
         self.dirty = false;
@@ -617,6 +739,117 @@ mod tests {
         let mut view = View::default();
         view.apply_sidecar(&sidecar, &run);
         assert_eq!(view.allocate_peak_id(), PeakId(10));
+    }
+
+    #[test]
+    fn moving_a_panel_forward_and_backward_shifts_the_rest() {
+        let mut order = PanelId::ALL.to_vec();
+        assert!(reorder(&mut order, 0, 2));
+        assert_eq!(
+            order,
+            vec![
+                PanelId::Warnings,
+                PanelId::Channels,
+                PanelId::RunSummary,
+                PanelId::Fractions
+            ]
+        );
+        assert!(reorder(&mut order, 3, 1));
+        assert_eq!(
+            order,
+            vec![
+                PanelId::Warnings,
+                PanelId::Fractions,
+                PanelId::Channels,
+                PanelId::RunSummary
+            ]
+        );
+    }
+
+    #[test]
+    fn dropping_a_panel_on_itself_or_off_the_end_is_not_a_reorder() {
+        let mut order = PanelId::ALL.to_vec();
+        assert!(!reorder(&mut order, 2, 2));
+        assert!(!reorder(&mut order, 0, 9));
+        assert!(!reorder(&mut order, 9, 0));
+        assert_eq!(order, PanelId::ALL.to_vec());
+    }
+
+    #[test]
+    fn a_reorder_marks_the_analysis_dirty() {
+        let mut view = View::default();
+        view.move_overview_panel(PanelId::Fractions, PanelId::RunSummary);
+        assert_eq!(view.overview_order.first(), Some(&PanelId::Fractions));
+        assert!(view.dirty);
+
+        view.dirty = false;
+        view.reset_overview_order();
+        assert!(view.overview_order_is_default());
+        assert!(view.dirty);
+    }
+
+    #[test]
+    fn an_unknown_saved_panel_id_is_dropped_rather_than_shown() {
+        let order = restore_order(&[
+            "fractions".to_string(),
+            "spectra_from_a_future_build".to_string(),
+            "run_summary".to_string(),
+        ]);
+        assert_eq!(order[0], PanelId::Fractions);
+        assert_eq!(order[1], PanelId::RunSummary);
+        assert_eq!(order.len(), PanelId::ALL.len());
+    }
+
+    #[test]
+    fn a_panel_missing_from_the_saved_order_is_still_shown() {
+        let order = restore_order(&["channels".to_string(), "channels".to_string()]);
+        assert_eq!(order[0], PanelId::Channels);
+        let mut sorted = order.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), PanelId::ALL.len(), "every panel appears once");
+    }
+
+    #[test]
+    fn sidecar_round_trip_restores_the_overview_arrangement() {
+        let run = test_run();
+        let mut view = View::default();
+        view.adopt_run(&run);
+        view.move_overview_panel(PanelId::Fractions, PanelId::RunSummary);
+        let arranged = view.overview_order.clone();
+        let sidecar = view.to_sidecar(&run);
+        assert_eq!(
+            sidecar.view.overview_order.as_deref(),
+            Some(
+                arranged
+                    .iter()
+                    .map(|p| p.as_str().to_string())
+                    .collect::<Vec<_>>()
+                    .as_slice()
+            ),
+            "the sidecar stores the stable string form"
+        );
+
+        let mut restored = View::default();
+        restored.apply_sidecar(&sidecar, &run);
+        assert_eq!(restored.overview_order, arranged);
+        assert!(!restored.dirty);
+    }
+
+    #[test]
+    fn a_sidecar_without_an_overview_order_keeps_the_default() {
+        let run = test_run();
+        let sidecar = Sidecar::for_run(&run);
+        assert!(sidecar.view.overview_order.is_none());
+
+        let mut view = View::default();
+        view.move_overview_panel(PanelId::Channels, PanelId::RunSummary);
+        view.apply_sidecar(&sidecar, &run);
+        assert_eq!(
+            view.overview_order.first(),
+            Some(&PanelId::Channels),
+            "an older sidecar says nothing about the order, so it must not clear it"
+        );
     }
 
     #[test]
