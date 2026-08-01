@@ -28,8 +28,9 @@
 
 use crate::error::{Error, Result};
 use crate::integrate::PlateMetric;
-use crate::model::{PeakResult, Run};
+use crate::model::{Color, PeakResult, Run};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Schema version written by this build.
@@ -86,6 +87,14 @@ pub struct ViewState {
     pub show_fractions: Option<bool>,
     #[serde(default)]
     pub plate_uniform_ramp: Option<bool>,
+    /// Trace colours the user chose by hand, keyed by channel id.
+    ///
+    /// Absent in sidecars written before this field existed, hence the `Option`:
+    /// "this build never had the feature" and "the user cleared every override"
+    /// are different facts, and only the second should be allowed to wipe a
+    /// colour a future merge might want to keep.
+    #[serde(default)]
+    pub channel_colors: Option<BTreeMap<String, Color>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -316,6 +325,28 @@ mod tests {
         let json = serde_json::to_string_pretty(&s).unwrap();
         let back = from_json(&json).unwrap();
         assert_eq!(s, back);
+    }
+
+    #[test]
+    fn user_trace_colours_survive_a_round_trip_and_are_optional_on_the_wire() {
+        let mut s = Sidecar::default();
+        s.view.channel_colors = Some(BTreeMap::from([(
+            "MWave2".to_string(),
+            Color::new(0xC4, 0x77, 0x3D, 0xFF),
+        )]));
+        let back = from_json(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.view.channel_colors, s.view.channel_colors);
+
+        // A sidecar written before the field existed must still load; refusing it
+        // would strand every analysis saved by an earlier build.
+        let legacy = r#"{
+            "version": 1,
+            "source": { "file_name": "run.ngcAnalysis", "run_name": "SEC", "channel_ids": [] },
+            "view": { "visible_channels": ["MWave2"], "dark_mode": true }
+        }"#;
+        let old = from_json(legacy).expect("a pre-colour sidecar should still parse");
+        assert_eq!(old.view.channel_colors, None);
+        assert_eq!(old.view.visible_channels, vec!["MWave2".to_string()]);
     }
 
     #[test]
