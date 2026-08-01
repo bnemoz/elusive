@@ -6,6 +6,7 @@
 //! top, HEP96 plate below, hover in either direction.
 
 use crate::egui_adapter::{self as adapt, c, Mode};
+use crate::export_image;
 use crate::theme::{color, measure, spacing, Theme};
 use crate::view::{BaselineChoice, Interaction, Section, View};
 use crate::widgets::{self, chromatogram, panels, plate};
@@ -32,6 +33,35 @@ const NAV_COLLAPSE_GLYPH: &str = "⏴";
 /// Glyph on the toggle when the rail is collapsed.
 const NAV_EXPAND_GLYPH: &str = "⏵";
 
+/// How long to wait for the windowing backend to hand back the framebuffer.
+///
+/// Not every platform and backend serves `ViewportCommand::Screenshot`. Without a
+/// deadline an unsupported one would leave the request in flight forever and the
+/// user staring at "Capturing…" with no explanation.
+const CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A chromatogram screenshot in flight.
+///
+/// eframe serves the screenshot command after painting the frame that raised it
+/// and delivers the pixels as an input event on the *next* frame, so a capture
+/// necessarily spans frames and cannot live in a local.
+struct Capture {
+    path: std::path::PathBuf,
+    /// The pane's rect on the frame the command was sent for, in logical points.
+    ///
+    /// `None` until the command has gone out, which also means "the chromatogram
+    /// still has to be brought on screen": the request can come from the Reports
+    /// tab, where there is no chart to photograph.
+    rect: Option<egui::Rect>,
+    /// Wall-clock deadline.
+    ///
+    /// Deliberately not the egui clock: `input.time` is sampled at the start of a
+    /// frame, and the frame that opens the save dialog is stalled for as long as
+    /// the user browses. A deadline set from that stale reading would already have
+    /// passed by the next frame.
+    deadline: std::time::Instant,
+}
+
 pub struct EluSiveApp {
     run: Option<Run>,
     view: View,
@@ -44,6 +74,9 @@ pub struct EluSiveApp {
     styled: bool,
     /// A run named on the command line, opened on the first frame.
     pending_open: Option<std::path::PathBuf>,
+    /// Where the chromatogram drew on the frame just rendered, in logical points.
+    chart_rect: Option<egui::Rect>,
+    capture: Option<Capture>,
 }
 
 impl EluSiveApp {
@@ -63,6 +96,8 @@ impl EluSiveApp {
             missing_fonts,
             styled: true,
             pending_open: None,
+            chart_rect: None,
+            capture: None,
         }
     }
 
@@ -200,6 +235,121 @@ impl EluSiveApp {
         };
         match std::fs::write(&path, contents) {
             Ok(()) => self.note(ctx, format!("Exported {}", path.display())),
+            Err(e) => self.note(ctx, format!("Export failed: {e}")),
+        }
+    }
+
+    // --- chromatogram image export -------------------------------------------
+    //
+    // "As seen" is the requirement, so this photographs the pane rather than
+    // re-plotting it: zoom, visible channels, fraction zones, peak shading and
+    // the hover highlight are whatever is on screen at that moment. Re-plotting
+    // offscreen would need a second renderer that could drift from the first, and
+    // would have to invent bounds — the one thing `chromatogram::data_y_range`
+    // exists to avoid.
+
+    /// Ask for a path, then put a framebuffer capture in flight.
+    fn request_chromatogram_png(&mut self, ctx: &egui::Context) {
+        let Some(run) = &self.run else { return };
+        let default_name = export_image::default_file_name(&stem(run));
+
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name(&default_name)
+            .add_filter("PNG image", &["png"])
+            .save_file()
+        else {
+            return;
+        };
+        let path = export_image::with_png_extension(path);
+
+        self.note(
+            ctx,
+            format!("Capturing the chromatogram to {}…", path.display()),
+        );
+        self.capture = Some(Capture {
+            path,
+            rect: None,
+            deadline: std::time::Instant::now() + CAPTURE_TIMEOUT,
+        });
+        ctx.request_repaint();
+    }
+
+    /// Advance a capture at the end of a frame.
+    ///
+    /// Sending the command here rather than when the button was clicked is what
+    /// makes the crop correct: `chart_rect` now describes the frame that is about
+    /// to be painted, which is exactly the frame the backend will read back.
+    fn drive_capture(&mut self, ctx: &egui::Context) {
+        let Some(mut capture) = self.capture.take() else {
+            return;
+        };
+
+        if std::time::Instant::now() > capture.deadline {
+            let reason = if capture.rect.is_none() {
+                "the chromatogram never came on screen"
+            } else {
+                "this platform did not return the window contents"
+            };
+            self.note(ctx, format!("Chromatogram export timed out: {reason}."));
+            return;
+        }
+
+        if capture.rect.is_none() {
+            match self.chart_rect {
+                Some(rect) => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(
+                        egui::UserData::default(),
+                    ));
+                    capture.rect = Some(rect);
+                }
+                // The request can come from the Reports tab, which does not draw a
+                // chart. Show the user the thing they asked to photograph.
+                None => self.view.section = Section::Chromatograms,
+            }
+        }
+
+        // Nothing else drives the loop: without this the app would idle until the
+        // next input and neither the pixels nor the timeout would ever arrive.
+        ctx.request_repaint();
+        self.capture = Some(capture);
+    }
+
+    /// Collect a captured framebuffer, before this frame draws over the state that
+    /// describes it.
+    fn collect_capture(&mut self, ctx: &egui::Context) {
+        let Some(rect) = self.capture.as_ref().and_then(|c| c.rect) else {
+            return;
+        };
+        let image = ctx.input(|i| {
+            i.events.iter().find_map(|event| match event {
+                egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                _ => None,
+            })
+        });
+        let (Some(image), Some(capture)) = (image, self.capture.take()) else {
+            return;
+        };
+
+        let Some(bounds) = export_image::crop_bounds(image.size, rect, ctx.pixels_per_point())
+        else {
+            self.note(
+                ctx,
+                "Chromatogram export failed: the pane has no visible area to capture.",
+            );
+            return;
+        };
+
+        let cropped = image.region_by_pixels(bounds.origin, bounds.size);
+        let rgba = export_image::to_rgba8(&cropped);
+        let png = match export_image::encode_png(cropped.size, &rgba) {
+            Ok(png) => png,
+            Err(e) => {
+                self.note(ctx, format!("Could not encode the chromatogram: {e}"));
+                return;
+            }
+        };
+        match std::fs::write(&capture.path, png) {
+            Ok(()) => self.note(ctx, format!("Exported {}", capture.path.display())),
             Err(e) => self.note(ctx, format!("Export failed: {e}")),
         }
     }
@@ -420,6 +570,12 @@ impl EluSiveApp {
                         if ui.button(label).clicked() {
                             self.save_sidecar(ctx);
                         }
+                        // Second entry point on purpose: the Reports tab owns the
+                        // exports, but this is where the user is looking when they
+                        // decide the view is worth keeping.
+                        if ui.button("Export image…").clicked() {
+                            self.request_chromatogram_png(ctx);
+                        }
                     });
 
                     ui.separator();
@@ -539,6 +695,11 @@ impl EluSiveApp {
                     .inner_margin(spacing::LG as i8),
             )
             .show(ui, |ui| {
+                // Stale by default: only a section that actually draws the chart
+                // may claim a rect, or an export raised from elsewhere would crop
+                // to wherever the chart happened to be last time.
+                self.chart_rect = None;
+
                 if self.run.is_none() {
                     self.empty_state(ui);
                     return;
@@ -551,7 +712,9 @@ impl EluSiveApp {
                 match view.section {
                     Section::Overview => overview(ui, run, view, t),
                     Section::Chromatograms | Section::Peaks => {
-                        if let Some(action) = linked_pane(ui, run, view, t) {
+                        let (action, rect) = linked_pane(ui, run, view, t);
+                        self.chart_rect = rect;
+                        if let Some(action) = action {
                             let ctx = ui.ctx().clone();
                             self.handle(&ctx, action);
                         }
@@ -661,6 +824,45 @@ enum ExportKind {
     Wells,
 }
 
+/// Something the Reports panel asked for, served once the frame's UI is built.
+///
+/// The buttons sit inside a closure that already borrows `self`, so the request
+/// is parked in egui's temp store and picked up at the end of `update`. It is a
+/// dedicated type rather than the bare `u8` this used to be: the store is keyed
+/// by `TypeId` as well as `Id`, so nothing else can land in the slot, the match
+/// below is exhaustive, and two buttons can no longer quietly agree on the same
+/// number and perform each other's action.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeferredAction {
+    PeaksCsv,
+    WellsCsv,
+    MarkdownCopied,
+    ChromatogramPng,
+}
+
+impl DeferredAction {
+    fn slot() -> egui::Id {
+        egui::Id::new("deferred-action")
+    }
+
+    fn raise(self, ui: &egui::Ui) {
+        ui.data_mut(|d| d.insert_temp(Self::slot(), self));
+    }
+
+    /// Read and clear the slot, so one click serves exactly one action.
+    ///
+    /// Read-then-`remove` rather than `remove_temp`, whose `T: Default` bound
+    /// would force this enum to nominate a default variant — a value that means
+    /// "do something" standing in for "nothing was asked for".
+    fn take(ctx: &egui::Context) -> Option<Self> {
+        ctx.data_mut(|d| {
+            let action = d.get_temp::<Self>(Self::slot());
+            d.remove::<Self>(Self::slot());
+            action
+        })
+    }
+}
+
 /// The low-contrast three-peak mark used for empty and loading states.
 fn mark(ui: &mut egui::Ui, t: Theme) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(180.0, 60.0), egui::Sense::hover());
@@ -720,7 +922,15 @@ fn overview(ui: &mut egui::Ui, run: &Run, view: &mut View, t: Theme) {
 }
 
 /// The single linked pane: chromatogram above, plate below, detail rail right.
-fn linked_pane(ui: &mut egui::Ui, run: &Run, view: &mut View, t: Theme) -> Option<Interaction> {
+///
+/// Reports the chart's own rect alongside the interaction so an image export can
+/// crop a framebuffer capture down to it.
+fn linked_pane(
+    ui: &mut egui::Ui,
+    run: &Run,
+    view: &mut View,
+    t: Theme,
+) -> (Option<Interaction>, Option<egui::Rect>) {
     let mut outcome = chromatogram::ChartOutcome::default();
     let mut plate_hover = None;
 
@@ -822,7 +1032,7 @@ fn linked_pane(ui: &mut egui::Ui, run: &Run, view: &mut View, t: Theme) -> Optio
         });
 
     resolve_hover(ui.ctx(), run, view, plate_hover, outcome.hovered_volume);
-    outcome.interaction
+    (outcome.interaction, outcome.rect)
 }
 
 /// Decide the frame's hover state from what each pane reported.
@@ -877,7 +1087,9 @@ fn reports(ui: &mut egui::Ui, run: &Run, view: &mut View, t: Theme) {
             egui::RichText::new(
                 "Exports are plain CSV with a fixed column order, so they drop straight into a \
                  notebook or a script. The same peak table copies to the clipboard as Markdown \
-                 for pasting into an electronic lab notebook.",
+                 for pasting into an electronic lab notebook, and the chromatogram is exported \
+                 as a PNG of the pane exactly as it is on screen — same zoom, same visible \
+                 channels, same shading.",
             )
             .color(c(t.text_secondary)),
         );
@@ -885,13 +1097,13 @@ fn reports(ui: &mut egui::Ui, run: &Run, view: &mut View, t: Theme) {
 
         ui.horizontal(|ui| {
             if ui.button("Peak table (CSV)").clicked() {
-                ui.data_mut(|d| d.insert_temp(egui::Id::new("export"), 0u8));
+                DeferredAction::PeaksCsv.raise(ui);
             }
             if ui.button("Plate metrics (CSV)").clicked() {
-                ui.data_mut(|d| d.insert_temp(egui::Id::new("export"), 1u8));
+                DeferredAction::WellsCsv.raise(ui);
             }
             // Unlike the file exports this needs nothing from `self`, so it can
-            // run inline instead of going through the deferred-export channel.
+            // run inline instead of going through the deferred-action channel.
             let copy = ui.add_enabled(
                 !view.peaks.is_empty(),
                 egui::Button::new("Copy as Markdown"),
@@ -899,9 +1111,20 @@ fn reports(ui: &mut egui::Ui, run: &Run, view: &mut View, t: Theme) {
             if copy.clicked() {
                 ui.ctx().copy_text(sidecar::peaks_to_markdown(&view.peaks));
                 // Confirming it happened does need `self`, so that part defers.
-                ui.data_mut(|d| d.insert_temp(egui::Id::new("export"), 2u8));
+                DeferredAction::MarkdownCopied.raise(ui);
+            }
+            if ui.button("Chromatogram (PNG)").clicked() {
+                DeferredAction::ChromatogramPng.raise(ui);
             }
         });
+        ui.label(
+            egui::RichText::new(
+                "Exporting the image switches to the Chromatograms section, because the pane has \
+                 to be on screen to be captured.",
+            )
+            .font(adapt::font_micro())
+            .color(c(t.text_secondary)),
+        );
 
         ui.add_space(spacing::LG);
         panels::heading(ui, t, "Peak table preview");
@@ -952,6 +1175,10 @@ impl eframe::App for EluSiveApp {
             self.open_path(ctx, &path);
         }
 
+        // Before anything draws: the pixels describe the *previous* frame, and so
+        // does the `chart_rect` recorded with the request.
+        self.collect_capture(ctx);
+
         // Accept a run dropped onto the window — the fastest path from USB stick
         // to plot.
         let dropped: Vec<std::path::PathBuf> = ctx.input(|i| {
@@ -972,13 +1199,19 @@ impl eframe::App for EluSiveApp {
 
         // Export requests are raised inside the Reports panel, where `self` is
         // already borrowed; they are picked up here.
-        let pending: Option<u8> = ctx.data_mut(|d| d.remove_temp(egui::Id::new("export")));
-        match pending {
-            Some(0) => self.export(ctx, ExportKind::Peaks),
-            Some(1) => self.export(ctx, ExportKind::Wells),
-            Some(2) => self.note(ctx, "Peak table copied as Markdown."),
-            _ => {}
+        match DeferredAction::take(ctx) {
+            Some(DeferredAction::PeaksCsv) => self.export(ctx, ExportKind::Peaks),
+            Some(DeferredAction::WellsCsv) => self.export(ctx, ExportKind::Wells),
+            Some(DeferredAction::MarkdownCopied) => {
+                self.note(ctx, "Peak table copied as Markdown.")
+            }
+            Some(DeferredAction::ChromatogramPng) => self.request_chromatogram_png(ctx),
+            None => {}
         }
+
+        // Last, so the screenshot command goes out for a frame whose layout is
+        // already settled and whose `chart_rect` is the one just drawn.
+        self.drive_capture(ctx);
     }
 }
 
@@ -1008,6 +1241,29 @@ mod tests {
             for b in &Section::ALL[i + 1..] {
                 assert_ne!(a.icon(), b.icon(), "{} and {}", a.label(), b.label());
             }
+        }
+    }
+
+    /// Every deferred action must come back out as the one that went in.
+    ///
+    /// This channel used to carry a bare `u8`, and two features added on separate
+    /// branches both picked `2` — the Markdown copy and the PNG export served each
+    /// other's request once they met. Nothing about a number says which button
+    /// owns it, so the guard is the round trip itself.
+    #[test]
+    fn each_deferred_action_round_trips_as_itself() {
+        use DeferredAction::*;
+
+        for action in [PeaksCsv, WellsCsv, MarkdownCopied, ChromatogramPng] {
+            let ctx = egui::Context::default();
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| action.raise(ui));
+
+            assert_eq!(DeferredAction::take(&ctx), Some(action));
+            assert_eq!(
+                DeferredAction::take(&ctx),
+                None,
+                "{action:?} was served twice"
+            );
         }
     }
 

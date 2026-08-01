@@ -19,3 +19,4 @@ egui_plot.workspace = true
 rfd.workspace = true
 anyhow.workspace = true
 serde.workspace = true
+image.workspace = true
