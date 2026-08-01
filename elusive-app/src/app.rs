@@ -876,7 +876,8 @@ fn reports(ui: &mut egui::Ui, run: &Run, view: &mut View, t: Theme) {
         ui.label(
             egui::RichText::new(
                 "Exports are plain CSV with a fixed column order, so they drop straight into a \
-                 notebook or a script.",
+                 notebook or a script. The same peak table copies to the clipboard as Markdown \
+                 for pasting into an electronic lab notebook.",
             )
             .color(c(t.text_secondary)),
         );
@@ -889,25 +890,22 @@ fn reports(ui: &mut egui::Ui, run: &Run, view: &mut View, t: Theme) {
             if ui.button("Plate metrics (CSV)").clicked() {
                 ui.data_mut(|d| d.insert_temp(egui::Id::new("export"), 1u8));
             }
+            // Unlike the file exports this needs nothing from `self`, so it can
+            // run inline instead of going through the deferred-export channel.
+            let copy = ui.add_enabled(
+                !view.peaks.is_empty(),
+                egui::Button::new("Copy as Markdown"),
+            );
+            if copy.clicked() {
+                ui.ctx().copy_text(sidecar::peaks_to_markdown(&view.peaks));
+                // Confirming it happened does need `self`, so that part defers.
+                ui.data_mut(|d| d.insert_temp(egui::Id::new("export"), 2u8));
+            }
         });
 
         ui.add_space(spacing::LG);
         panels::heading(ui, t, "Peak table preview");
-        let csv = sidecar::peaks_to_csv(&view.peaks);
-        egui::ScrollArea::both()
-            .id_salt("csv-preview")
-            .max_height(200.0)
-            .show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new(if csv.lines().count() > 1 {
-                        csv
-                    } else {
-                        "No integrations to export yet.".to_string()
-                    })
-                    .font(adapt::font_code())
-                    .color(c(t.text_secondary)),
-                );
-            });
+        panels::peak_export_preview(ui, view, t);
 
         ui.add_space(spacing::LG);
         panels::heading(ui, t, "Sidecar");
@@ -978,6 +976,7 @@ impl eframe::App for EluSiveApp {
         match pending {
             Some(0) => self.export(ctx, ExportKind::Peaks),
             Some(1) => self.export(ctx, ExportKind::Wells),
+            Some(2) => self.note(ctx, "Peak table copied as Markdown."),
             _ => {}
         }
     }
