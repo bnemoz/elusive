@@ -44,7 +44,7 @@ empty grid.
 - **Chromatograms** — one plot per axis group (UV, conductivity, pH, pressure…),
   linked on the volume axis so pan and zoom stay in step. Hovering a fraction on
   the trace highlights its well, and hovering a well highlights its span.
-- **Peaks / Integration** — turn on *Integrate*, pick a baseline mode, and drag
+- **Peaks** — turn on *Integrate*, pick a baseline mode, and drag
   across a peak. Area, height, apex volume, FWHM and area-% appear in the table
   and the right-hand detail card.
 - **Calibration** — assign the Bio-Rad gel-filtration standards to peak apexes,

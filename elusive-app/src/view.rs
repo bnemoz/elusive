@@ -29,18 +29,16 @@ pub enum Section {
     Overview,
     Chromatograms,
     Peaks,
-    Integration,
     Calibration,
     Results,
     Reports,
 }
 
 impl Section {
-    pub const ALL: [Section; 7] = [
+    pub const ALL: [Section; 6] = [
         Section::Overview,
         Section::Chromatograms,
         Section::Peaks,
-        Section::Integration,
         Section::Calibration,
         Section::Results,
         Section::Reports,
@@ -51,7 +49,6 @@ impl Section {
             Section::Overview => "Overview",
             Section::Chromatograms => "Chromatograms",
             Section::Peaks => "Peaks",
-            Section::Integration => "Integration",
             Section::Calibration => "Calibration",
             Section::Results => "Results",
             Section::Reports => "Reports",
