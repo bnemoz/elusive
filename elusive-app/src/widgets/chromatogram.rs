@@ -1,16 +1,21 @@
 //! The chromatogram pane: stacked, x-linked plots — one per axis group.
 //!
 //! Channels are grouped by [`AxisGroup`] and each group gets its own plot with its
-//! own y-scale, all linked on the volume axis. The alternative — rescaling
+//! own y-scale, all linked on the shared x axis. The alternative — rescaling
 //! conductivity onto the UV axis — would put a number on screen that is not the
 //! number the instrument measured, so it is not on the table.
+//!
+//! The x axis shows either elution volume or elution time, per [`XAxis`]. That
+//! choice stops at the edge of this module: everything entering it (peaks,
+//! fractions, excluded regions, hover state) and everything leaving it
+//! ([`ChartOutcome`], [`Interaction`]) is in mL. See [`PlotTransform`].
 
 use crate::egui_adapter::{self as adapt, c, c_alpha, ca};
 use crate::theme::{chart, color, spacing, stroke, Rgb, Theme};
-use crate::view::{Interaction, View};
+use crate::view::{Interaction, View, XAxis};
 use egui::Ui;
 use egui_plot::{Line, Plot, PlotPoints, Polygon};
-use elusive_core::model::{AxisGroup, Channel, Color, Fraction, PeakId, PeakResult, Run};
+use elusive_core::model::{AxisGroup, Channel, Color, Fraction, PeakId, PeakResult, Run, Sample};
 
 /// Fraction of the pane's height given to the hero (UV) group.
 const HERO_HEIGHT_SHARE: f32 = 0.55;
@@ -60,7 +65,7 @@ pub fn show(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) -> ChartOutcome {
     for (idx, (group, height)) in groups.iter().zip(heights).enumerate() {
         let position = PlotPosition {
             is_hero: idx == 0,
-            x_axis_label: x_axis_label_for(idx, count),
+            x_axis_label: x_axis_label_for(idx, count, view.x_axis),
         };
         let (interaction, hovered, rect) = plot_group(ui, run, view, t, *group, height, position);
         if interaction.is_some() {
@@ -95,13 +100,14 @@ struct PlotPosition {
 
 /// The x-axis label for the plot at `idx` in a stack of `count` plots.
 ///
-/// The stack is x-linked, so repeating "Elution volume (mL)" under every plot
-/// is clutter — but it still has to appear *somewhere*, including in the
+/// The stack is x-linked, so repeating the axis name under every plot is
+/// clutter — but it still has to appear *somewhere*, including in the
 /// overwhelmingly common single-group (UV-only) view. Only the bottom-most
-/// plot gets it.
-fn x_axis_label_for(idx: usize, count: usize) -> &'static str {
+/// plot gets it. The wording follows the axis the user selected, because a plot
+/// labelled in mL while it is drawn in minutes is worse than no label at all.
+fn x_axis_label_for(idx: usize, count: usize, axis: XAxis) -> &'static str {
     if count > 0 && idx == count - 1 {
-        "Elution volume (mL)"
+        axis.label()
     } else {
         ""
     }
@@ -181,6 +187,202 @@ fn data_y_range(channels: &[(usize, &Channel)]) -> (f64, f64) {
     (lo, hi)
 }
 
+/// Everything a drawing function needs to turn stored data into plot coordinates.
+///
+/// The two axes are bundled rather than threaded separately because every overlay
+/// needs both, and because they are wanted at different times: the x half is the
+/// unit toggle, the y half is the place the planned per-group y-scaling will
+/// attach. Adding the pair once keeps the six drawing functions' signatures stable
+/// across both features.
+#[derive(Clone, Copy)]
+struct PlotTransform<'a> {
+    x: XMap<'a>,
+    y: YMap,
+}
+
+impl<'a> PlotTransform<'a> {
+    fn new(run: &'a Run, view: &View) -> Self {
+        Self {
+            x: XMap::new(run, view),
+            y: YMap::IDENTITY,
+        }
+    }
+}
+
+/// Placeholder for the per-group y transform.
+///
+/// Today every axis group draws in its own plot at its own natural scale, so
+/// there is nothing to remap and [`YMap::apply`] hands its argument straight
+/// back — deliberately, so current rendering is bit-identical to the code before
+/// the transform existed. The planned multi-y-scale feature (several groups
+/// sharing one plot, each with its own scale) fills this in with the offset and
+/// gain for a group; every call site that will need it already routes through
+/// here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct YMap;
+
+impl YMap {
+    const IDENTITY: YMap = YMap;
+
+    /// Display value → plot y. Exactly the identity: no arithmetic, so no
+    /// rounding is introduced on the default path.
+    #[inline]
+    fn apply(self, y: f64) -> f64 {
+        y
+    }
+
+    /// The group's y-extent, given the extent of its data.
+    ///
+    /// Separate from [`YMap::apply`] because a rescaling map does not
+    /// necessarily produce its axis extent by mapping the data extent — a
+    /// normalising one draws on a fixed unitless span regardless of the data.
+    /// Overlays are sized from the value this returns, so `data_y_range`'s
+    /// no-feedback guarantee still holds either way.
+    #[inline]
+    fn extent(self, data: (f64, f64)) -> (f64, f64) {
+        data
+    }
+}
+
+/// Translates between stored volume (mL) and the x coordinate on screen.
+///
+/// The stored model is always in mL. Time is a *display* transform applied on the
+/// way into the plot and undone on the way out, so an integration dragged while
+/// the time axis is active still produces the volume window the user pointed at,
+/// and a sidecar written afterwards is identical either way.
+///
+/// Traces never need this: every [`Sample`] already carries `time_s` alongside
+/// `volume_ml`, so a trace plots a different field of the same point. Only
+/// overlays that know a volume and nothing else (fractions, peaks, excluded
+/// regions, the hovered span) need a channel to interpolate against.
+#[derive(Clone, Copy)]
+struct XMap<'a> {
+    axis: XAxis,
+    /// Channel supplying the volume↔time relation. `None` when the run has no
+    /// samples to interpolate from, in which case time-axis overlays are skipped
+    /// rather than drawn in the wrong place.
+    reference: Option<&'a Channel>,
+}
+
+impl<'a> XMap<'a> {
+    fn new(run: &'a Run, view: &View) -> Self {
+        // The hero channel is the one the user is reading, so its time base is the
+        // one to map against; any channel with samples will do as a fallback,
+        // because time and volume are properties of the run, not of a detector.
+        let reference = view
+            .hero_channel_id
+            .as_ref()
+            .and_then(|id| run.channel(id))
+            .filter(|c| !c.is_empty())
+            .or_else(|| run.hero_channel())
+            .or_else(|| run.channels.iter().find(|c| !c.is_empty()));
+        Self {
+            axis: view.x_axis,
+            reference,
+        }
+    }
+
+    /// x for a sample of a plotted trace — no interpolation, the point knows both.
+    fn sample_x(self, s: &Sample) -> f64 {
+        match self.axis {
+            XAxis::Volume => s.volume_ml as f64,
+            XAxis::Time => s.time_s as f64 / 60.0,
+        }
+    }
+
+    /// x for a stored volume, or `None` when time mode has nothing to map with.
+    fn to_x(self, volume_ml: f32) -> Option<f64> {
+        match self.axis {
+            XAxis::Volume => Some(volume_ml as f64),
+            XAxis::Time => clamped_time_min(self.reference?, volume_ml).map(|t| t as f64),
+        }
+    }
+
+    /// Both ends of a window, or `None` if either end cannot be mapped. Overlays
+    /// are all-or-nothing: half a fraction band is worse than none.
+    fn to_window(self, a: f32, b: f32) -> Option<(f64, f64)> {
+        Some((self.to_x(a)?, self.to_x(b)?))
+    }
+
+    /// A pointer coordinate back to the volume the model speaks, refusing to
+    /// answer outside the run.
+    ///
+    /// Used for hover linking, where "past the end of the data" must stay
+    /// distinguishable from "at the last sample" — otherwise pointing into the
+    /// empty space right of the trace would light up the final fraction.
+    fn to_volume(self, x: f32) -> Option<f32> {
+        match self.axis {
+            XAxis::Volume => x.is_finite().then_some(x),
+            XAxis::Time => self.reference?.volume_ml_at_time_min(x),
+        }
+    }
+
+    /// The same inverse, clamped, for turning a finished drag into an integration
+    /// window.
+    ///
+    /// A drag that overshoots the trace means "to the end of the run", which is
+    /// what `integrate::integrate_peak` already does with an out-of-range
+    /// endpoint. Refusing the conversion here would silently drop the whole
+    /// integration instead.
+    fn to_volume_clamped(self, x: f32) -> Option<f32> {
+        match self.axis {
+            XAxis::Volume => x.is_finite().then_some(x),
+            XAxis::Time => clamped_volume_ml(self.reference?, x),
+        }
+    }
+
+    /// The pointer's position expressed in the *other* unit, for the hover
+    /// readout. Strict, so the second line simply disappears off the ends of the
+    /// data rather than repeating the last sample.
+    fn counterpart(self, x: f32) -> Option<f64> {
+        let reference = self.reference?;
+        match self.axis {
+            XAxis::Volume => reference.time_min_at_volume(x).map(|t| t as f64),
+            XAxis::Time => reference.volume_ml_at_time_min(x).map(|v| v as f64),
+        }
+    }
+}
+
+/// Time in minutes at a volume, clamped to the channel's sampled range.
+///
+/// Mirrors `integrate::endpoint_value`'s reasoning: a fraction window that ends a
+/// hair past the last UV sample, or a drag that overshoots the trace, should pin
+/// to the end of the run rather than make the overlay disappear.
+fn clamped_time_min(channel: &Channel, volume_ml: f32) -> Option<f32> {
+    if let Some(t) = channel.time_min_at_volume(volume_ml) {
+        return Some(t);
+    }
+    if !volume_ml.is_finite() {
+        return None;
+    }
+    // Non-finite samples are padding in some exports, so clamp to the first and
+    // last *usable* points rather than to `samples[0]` and `samples[len - 1]`.
+    let first = channel.samples.iter().find(|s| s.is_finite())?;
+    let last = channel.samples.iter().rev().find(|s| s.is_finite())?;
+    Some(if volume_ml <= first.volume_ml {
+        first.time_s / 60.0
+    } else {
+        last.time_s / 60.0
+    })
+}
+
+/// Volume at a time in minutes, clamped to the channel's sampled range.
+fn clamped_volume_ml(channel: &Channel, time_min: f32) -> Option<f32> {
+    if let Some(v) = channel.volume_ml_at_time_min(time_min) {
+        return Some(v);
+    }
+    if !time_min.is_finite() {
+        return None;
+    }
+    let first = channel.samples.iter().find(|s| s.is_finite())?;
+    let last = channel.samples.iter().rev().find(|s| s.is_finite())?;
+    Some(if time_min * 60.0 <= first.time_s {
+        first.volume_ml
+    } else {
+        last.volume_ml
+    })
+}
+
 /// The peak facts the hover readout needs, lifted out of [`View`].
 ///
 /// `label_formatter` holds its closure for as long as the `Plot` lives, which
@@ -242,13 +444,45 @@ fn fraction_at(run: &Run, x: f64) -> Option<&Fraction> {
 /// table by eye to answer "which tube is this, and did I integrate it?". The
 /// fraction and peak lines are omitted when they do not apply — a placeholder line
 /// is noise the eye still has to parse.
-fn hover_label(run: &Run, peaks: &[HoverPeak], unit: &str, x: f64, y: f64) -> String {
-    let mut out = format!("{} mL\n{}", adapt::num(x, 3), adapt::num(y, 3));
+///
+/// `x` is in whatever unit `axis` names and `counterpart` is the same position in
+/// the other unit, which `DESIGN_SYSTEM.md` §10.1 asks to keep in view. That
+/// second value is also what makes the fraction and peak lines work off the
+/// volume axis: in time mode the counterpart *is* the volume, and its strictness
+/// off the ends of the data is exactly the behaviour those lookups want.
+fn hover_label(
+    run: &Run,
+    peaks: &[HoverPeak],
+    unit: &str,
+    axis: XAxis,
+    x: f64,
+    y: f64,
+    counterpart: Option<f64>,
+) -> String {
+    let mut out = format!("{} {}", adapt::num(x, 3), axis.unit());
+    if let Some(other) = counterpart {
+        out.push_str(&format!(
+            "\n{} {}",
+            adapt::num(other, 3),
+            axis.other().unit()
+        ));
+    }
+    out.push('\n');
+    out.push_str(&adapt::num(y, 3));
     if !unit.is_empty() {
         out.push(' ');
         out.push_str(unit);
     }
-    if let Some(f) = fraction_at(run, x) {
+
+    // Fractions and peaks are stored in mL, so they are looked up in mL.
+    let volume_ml = match axis {
+        XAxis::Volume => Some(x),
+        XAxis::Time => counterpart,
+    };
+    let Some(v) = volume_ml else {
+        return out;
+    };
+    if let Some(f) = fraction_at(run, v) {
         // Fall back to the tube number when the rack mapping is unresolved:
         // `well` is `None` for rack types the parser cannot lay out.
         let which = f
@@ -257,7 +491,7 @@ fn hover_label(run: &Run, peaks: &[HoverPeak], unit: &str, x: f64, y: f64) -> St
             .unwrap_or_else(|| format!("tube {}", f.tube));
         out.push_str(&format!("\nFraction {which}"));
     }
-    if let Some(p) = peaks.iter().find(|p| p.covers(x)) {
+    if let Some(p) = peaks.iter().find(|p| p.covers(v)) {
         // Matches the "Peak {n}" wording of the peak-detail panel.
         out.push_str(&format!("\nPeak {}", p.id.0));
     }
@@ -302,12 +536,22 @@ fn plot_group(
     let readout_peaks = hover_peaks(run, &view.peaks, group);
     let readout_unit = unit.clone();
 
+    let tf = PlotTransform::new(run, view);
+    let axis = view.x_axis;
+    let readout_x = tf.x;
+
     let mut interaction = None;
     let mut hovered_volume = None;
-    let plotted = Plot::new(format!("chromatogram-{group:?}"))
+    // The axis key is part of both ids on purpose. egui_plot remembers pan/zoom
+    // per plot id and shares bounds per link group, and those bounds are bare
+    // numbers: switching unit under a remembered `0..38` window would leave the
+    // plot showing 0–38 *minutes* of a 75-minute run. Keying by axis gives each
+    // mode its own remembered view, so a switch lands on auto-fit bounds and a
+    // switch back restores where the user was.
+    let plotted = Plot::new(format!("chromatogram-{group:?}-{}", axis.key()))
         .height(height)
         .sense(egui::Sense::click_and_drag())
-        .link_axis("chromatogram-x", [true, false])
+        .link_axis(format!("chromatogram-x-{}", axis.key()), [true, false])
         .allow_drag([!integrating, !integrating])
         .allow_boxed_zoom(!integrating)
         .show_grid([true, true])
@@ -324,40 +568,47 @@ fn plot_group(
                 egui_plot::HoverPosition::NearDataPoint { position, .. } => position,
                 egui_plot::HoverPosition::Elsewhere { position } => position,
             };
-            Some(hover_label(run, &readout_peaks, &readout_unit, p.x, p.y))
+            Some(hover_label(
+                run,
+                &readout_peaks,
+                &readout_unit,
+                axis,
+                p.x,
+                p.y,
+                readout_x.counterpart(p.x as f32),
+            ))
         })
         .show(ui, |plot_ui| {
             // Fixed, data-derived extent. Deliberately NOT `plot_ui.plot_bounds()`
-            // — see `data_y_range`.
-            let (y_lo, y_hi) = data_y_range(&channels);
+            // — see `data_y_range`. The drawers below receive it already mapped,
+            // so none of them re-applies the y transform to it.
+            let (y_lo, y_hi) = tf.y.extent(data_y_range(&channels));
 
             // 1. Fraction bands sit *under* the traces so the signal stays on top.
             if is_hero {
-                draw_fraction_zones(plot_ui, run, view, t, y_lo, y_hi);
-                draw_highlighted_span(plot_ui, view, t, y_lo, y_hi);
-                draw_excluded_regions(plot_ui, view, t, y_lo, y_hi);
+                draw_fraction_zones(plot_ui, run, view, t, tf, y_lo, y_hi);
+                draw_highlighted_span(plot_ui, view, t, tf, y_lo, y_hi);
+                draw_excluded_regions(plot_ui, view, t, tf, y_lo, y_hi);
             }
 
             // 2. Integrated peak regions, translucent (rule #2).
-            draw_peak_regions(plot_ui, view, group, run, y_lo);
+            draw_peak_regions(plot_ui, view, group, run, tf, y_lo);
 
             // 3. The traces themselves.
             for (i, channel) in &channels {
-                draw_channel(plot_ui, channel, *i, view, t);
+                draw_channel(plot_ui, channel, *i, view, t, tf);
             }
 
             // 4. The pending drag selection, so the user sees the window forming.
+            //    Already in display units — see the drag handling below — so it
+            //    needs no x mapping.
             if let Some((a, b)) = view.pending_selection {
+                let (a, b) = (a as f64, b as f64);
                 let fill = c_alpha(chart::SELECTION_STROKE, 40);
                 plot_ui.polygon(
                     Polygon::new(
                         "",
-                        PlotPoints::from(vec![
-                            [a as f64, y_lo],
-                            [b as f64, y_lo],
-                            [b as f64, y_hi],
-                            [a as f64, y_hi],
-                        ]),
+                        PlotPoints::from(vec![[a, y_lo], [b, y_lo], [b, y_hi], [a, y_hi]]),
                     )
                     .fill_color(fill)
                     .stroke(egui::Stroke::new(
@@ -371,11 +622,16 @@ fn plot_group(
             let response = plot_ui.response();
             let pointer = plot_ui.pointer_coordinate();
 
+            // Reported in mL whatever the axis shows: the plate, the fraction
+            // table and every other pane are keyed to volume.
             if response.hovered() {
-                hovered_volume = pointer.map(|p| p.x as f32);
+                hovered_volume = pointer.and_then(|p| tf.x.to_volume(p.x as f32));
             }
 
             if integrating {
+                // `drag_anchor` and `pending_selection` stay in display units —
+                // they only exist to draw the band being dragged, and `View` drops
+                // them if the axis changes underneath.
                 if response.drag_started_by(egui::PointerButton::Primary) {
                     view.drag_anchor = pointer.map(|p| p.x as f32);
                 }
@@ -386,8 +642,17 @@ fn plot_group(
                 }
                 if response.drag_stopped_by(egui::PointerButton::Primary) {
                     if let Some((a, b)) = view.pending_selection.take() {
-                        if (b - a).abs() > f32::EPSILON {
-                            interaction = Some(Interaction::IntegrateRange(a.min(b), a.max(b)));
+                        // Back to mL before the interaction leaves this module:
+                        // `Interaction::IntegrateRange` and `integrate_peak` are
+                        // defined in volume, so raising a range in minutes would
+                        // integrate a plausible-looking but wrong window.
+                        if let (Some(v0), Some(v1)) =
+                            (tf.x.to_volume_clamped(a), tf.x.to_volume_clamped(b))
+                        {
+                            if (v1 - v0).abs() > f32::EPSILON {
+                                interaction =
+                                    Some(Interaction::IntegrateRange(v0.min(v1), v0.max(v1)));
+                            }
                         }
                     }
                     view.drag_anchor = None;
@@ -460,14 +725,22 @@ fn draw_channel(
     index: usize,
     view: &View,
     t: Theme,
+    tf: PlotTransform<'_>,
 ) {
     // Each channel builds its own point list from its own samples — no shared
-    // index is assumed anywhere (`model.rs` invariant 1).
+    // index is assumed anywhere (`model.rs` invariant 1). That extends to the x
+    // axis: a channel sampled at its own rate reads its *own* time base, so
+    // nothing is interpolated through another channel to draw a trace.
     let points: Vec<[f64; 2]> = channel
         .samples
         .iter()
         .filter(|s| s.is_finite())
-        .map(|s| [s.volume_ml as f64, (s.value * channel.display_scale) as f64])
+        .map(|s| {
+            [
+                tf.x.sample_x(s),
+                tf.y.apply((s.value * channel.display_scale) as f64),
+            ]
+        })
         .collect();
     if points.len() < 2 {
         return;
@@ -499,6 +772,7 @@ fn draw_fraction_zones(
     run: &Run,
     view: &View,
     t: Theme,
+    tf: PlotTransform<'_>,
     y_lo: f64,
     y_hi: f64,
 ) {
@@ -506,10 +780,16 @@ fn draw_fraction_zones(
         return;
     }
     for (idx, f) in run.fractions.iter().enumerate() {
-        let (a, b) = f.volume_window();
-        if !a.is_finite() || !b.is_finite() || b <= a {
+        let (v0, v1) = f.volume_window();
+        if !v0.is_finite() || !v1.is_finite() || v1 <= v0 {
             continue;
         }
+        // A fraction records both a volume and a time window, but only the volume
+        // one is reconciled and corrected by the parser, so the displayed band is
+        // always the volume window mapped onto the current axis.
+        let Some((a, b)) = tf.x.to_window(v0, v1) else {
+            continue;
+        };
         let alpha = if idx % 2 == 0 {
             FRACTION_ZONE_ALPHA
         } else {
@@ -518,12 +798,7 @@ fn draw_fraction_zones(
         plot_ui.polygon(
             Polygon::new(
                 "",
-                PlotPoints::from(vec![
-                    [a as f64, y_lo],
-                    [b as f64, y_lo],
-                    [b as f64, y_hi],
-                    [a as f64, y_hi],
-                ]),
+                PlotPoints::from(vec![[a, y_lo], [b, y_lo], [b, y_hi], [a, y_hi]]),
             )
             .fill_color(c_alpha(t.fraction_highlight, alpha))
             .stroke(egui::Stroke::new(stroke::HAIRLINE, c_alpha(t.axis, 60)))
@@ -537,21 +812,22 @@ fn draw_highlighted_span(
     plot_ui: &mut egui_plot::PlotUi<'_>,
     view: &View,
     t: Theme,
+    tf: PlotTransform<'_>,
     y_lo: f64,
     y_hi: f64,
 ) {
-    let Some((a, b)) = view.hovered_vol_range else {
+    // Shared hover state is in mL — the plate writes it too — so it maps like any
+    // other overlay.
+    let Some((v0, v1)) = view.hovered_vol_range else {
+        return;
+    };
+    let Some((a, b)) = tf.x.to_window(v0, v1) else {
         return;
     };
     plot_ui.polygon(
         Polygon::new(
             "",
-            PlotPoints::from(vec![
-                [a as f64, y_lo],
-                [b as f64, y_lo],
-                [b as f64, y_hi],
-                [a as f64, y_hi],
-            ]),
+            PlotPoints::from(vec![[a, y_lo], [b, y_lo], [b, y_hi], [a, y_hi]]),
         )
         .fill_color(c_alpha(t.fraction_highlight, 90))
         .stroke(egui::Stroke::new(
@@ -566,11 +842,15 @@ fn draw_excluded_regions(
     plot_ui: &mut egui_plot::PlotUi<'_>,
     view: &View,
     _t: Theme,
+    tf: PlotTransform<'_>,
     y_lo: f64,
     y_hi: f64,
 ) {
     for region in &view.excluded_regions {
-        let (a, b) = (region.v_start_ml as f64, region.v_end_ml as f64);
+        // Stored in mL and saved that way; only the drawing moves.
+        let Some((a, b)) = tf.x.to_window(region.v_start_ml, region.v_end_ml) else {
+            continue;
+        };
         plot_ui.polygon(
             Polygon::new(
                 "",
@@ -590,6 +870,7 @@ fn draw_peak_regions(
     view: &View,
     group: AxisGroup,
     run: &Run,
+    tf: PlotTransform<'_>,
     y_lo: f64,
 ) {
     for peak in &view.peaks {
@@ -600,17 +881,27 @@ fn draw_peak_regions(
             continue;
         }
 
+        // The window is selected in volume — the unit the peak was integrated in —
+        // and only the resulting points are moved onto the display axis.
         let mut outline: Vec<[f64; 2]> = channel
             .samples_in_volume(peak.v_start_ml, peak.v_end_ml)
             .iter()
             .filter(|s| s.is_finite())
-            .map(|s| [s.volume_ml as f64, (s.value * channel.display_scale) as f64])
+            .map(|s| {
+                [
+                    tf.x.sample_x(s),
+                    tf.y.apply((s.value * channel.display_scale) as f64),
+                ]
+            })
             .collect();
         if outline.len() < 2 {
             continue;
         }
 
-        let baseline_y = baseline_points(peak, channel, y_lo);
+        let Some((x_start, x_end)) = tf.x.to_window(peak.v_start_ml, peak.v_end_ml) else {
+            continue;
+        };
+        let baseline_y = baseline_points(peak, channel, tf, y_lo, x_start, x_end);
         outline.extend(baseline_y.into_iter().rev());
 
         let selected = view.selected_peak == Some(peak.id);
@@ -642,10 +933,17 @@ fn draw_peak_regions(
 }
 
 /// The two endpoints of the peak's baseline, in display units.
+///
+/// `x_start`/`x_end` are the window's edges already mapped onto the current axis;
+/// the baseline *values* are still worked out in volume, because that is the
+/// geometry the integration used and it must not change with the view.
 fn baseline_points(
     peak: &elusive_core::model::PeakResult,
     channel: &Channel,
+    tf: PlotTransform<'_>,
     y_lo: f64,
+    x_start: f64,
+    x_end: f64,
 ) -> Vec<[f64; 2]> {
     use elusive_core::model::BaselineMode;
     let scale = channel.display_scale as f64;
@@ -672,7 +970,7 @@ fn baseline_points(
         }
     };
 
-    vec![[peak.v_start_ml as f64, y0], [peak.v_end_ml as f64, y1]]
+    vec![[x_start, tf.y.apply(y0)], [x_end, tf.y.apply(y1)]]
 }
 
 /// Width of the legend swatch. The dash patterns below are laid out against it,
@@ -938,14 +1236,14 @@ mod tests {
         // Regression: this is the overwhelmingly common UV-only view. The old
         // `is_hero` check blanked the label here because the one plot is both
         // the hero and the bottom of the stack.
-        assert_eq!(x_axis_label_for(0, 1), "Elution volume (mL)");
+        assert_eq!(x_axis_label_for(0, 1, XAxis::Volume), "Elution volume (mL)");
     }
 
     #[test]
     fn a_stacked_view_labels_only_the_bottom_plot() {
-        assert_eq!(x_axis_label_for(0, 3), "");
-        assert_eq!(x_axis_label_for(1, 3), "");
-        assert_eq!(x_axis_label_for(2, 3), "Elution volume (mL)");
+        assert_eq!(x_axis_label_for(0, 3, XAxis::Volume), "");
+        assert_eq!(x_axis_label_for(1, 3, XAxis::Volume), "");
+        assert_eq!(x_axis_label_for(2, 3, XAxis::Volume), "Elution volume (mL)");
     }
 
     // --- hover readout ----------------------------------------------------
@@ -1012,7 +1310,7 @@ mod tests {
     fn hover_inside_a_fraction_and_a_peak_reports_both() {
         let run = hover_run();
         let peaks = hover_peaks(&run, &[peak(3, "MWave2", 11.8, 12.6)], AxisGroup::Uv);
-        let label = hover_label(&run, &peaks, "mAU", 12.48, 412.6);
+        let label = hover_label(&run, &peaks, "mAU", XAxis::Volume, 12.48, 412.6, None);
         assert_eq!(label, "12.480 mL\n412.600 mAU\nFraction D8\nPeak 3");
     }
 
@@ -1020,7 +1318,7 @@ mod tests {
     fn hover_outside_every_window_reports_only_the_coordinates() {
         let run = hover_run();
         let peaks = hover_peaks(&run, &[peak(1, "MWave2", 11.0, 12.0)], AxisGroup::Uv);
-        let label = hover_label(&run, &peaks, "mAU", 4.0, 1.5);
+        let label = hover_label(&run, &peaks, "mAU", XAxis::Volume, 4.0, 1.5, None);
         // An "n/a" line would still cost the eye a read, so it is left out.
         assert_eq!(label, "4.000 mL\n1.500 mAU");
     }
@@ -1028,7 +1326,7 @@ mod tests {
     #[test]
     fn hover_inside_a_fraction_without_a_peak_omits_the_peak_line() {
         let run = hover_run();
-        let label = hover_label(&run, &[], "mAU", 10.5, 22.0);
+        let label = hover_label(&run, &[], "mAU", XAxis::Volume, 10.5, 22.0, None);
         assert_eq!(label, "10.500 mL\n22.000 mAU\nFraction A1");
     }
 
@@ -1041,13 +1339,15 @@ mod tests {
         let uv = hover_peaks(&run, &all, AxisGroup::Uv);
         assert!(uv.is_empty());
         assert_eq!(
-            hover_label(&run, &uv, "mAU", 10.5, 22.0),
+            hover_label(&run, &uv, "mAU", XAxis::Volume, 10.5, 22.0, None),
             "10.500 mL\n22.000 mAU\nFraction A1"
         );
 
         // Hovering the conductivity plot: same peak, now in context.
         let cond = hover_peaks(&run, &all, AxisGroup::Conductivity);
-        assert!(hover_label(&run, &cond, "mS/cm", 10.5, 3.0).ends_with("\nPeak 4"));
+        assert!(
+            hover_label(&run, &cond, "mS/cm", XAxis::Volume, 10.5, 3.0, None).ends_with("\nPeak 4")
+        );
     }
 
     #[test]
@@ -1061,7 +1361,7 @@ mod tests {
     fn an_unmapped_rack_falls_back_to_the_tube_number() {
         let mut run = hover_run();
         run.fractions = vec![fraction(7, None, 10.0, 11.0)];
-        let label = hover_label(&run, &[], "mAU", 10.5, 1.0);
+        let label = hover_label(&run, &[], "mAU", XAxis::Volume, 10.5, 1.0, None);
         assert!(label.ends_with("\nFraction tube 7"), "{label}");
     }
 
@@ -1075,7 +1375,7 @@ mod tests {
             fraction(2, Some(Well::new(0, 1)), f32::NAN, 11.0),
         ];
         assert_eq!(
-            hover_label(&run, &[], "mAU", 10.0, 1.0),
+            hover_label(&run, &[], "mAU", XAxis::Volume, 10.0, 1.0, None),
             "10.000 mL\n1.000 mAU"
         );
     }
@@ -1083,7 +1383,7 @@ mod tests {
     #[test]
     fn a_channel_without_a_display_unit_still_reads_cleanly() {
         let run = hover_run();
-        let label = hover_label(&run, &[], "", 4.0, 1.5);
+        let label = hover_label(&run, &[], "", XAxis::Volume, 4.0, 1.5, None);
         assert_eq!(
             label, "4.000 mL\n1.500",
             "no trailing space when unit is blank"
@@ -1175,5 +1475,211 @@ mod tests {
         // The picker hands back an `Rgb`; the sidecar stores a core `Color`.
         assert_eq!(to_rgb(to_core_color(PICKED)), PICKED);
         assert_eq!(to_core_color(PICKED).a, 0xFF);
+    }
+
+    // --- x-axis mapping ---------------------------------------------------
+
+    /// Two minutes at 1 mL/min then two at 0.5 mL/min, so a constant-rate
+    /// assumption and an interpolation disagree everywhere past 2 mL.
+    fn mapping_run() -> Run {
+        let mut uv = Channel::new("MWave2", "UV 280 nm", ChannelKind::Uv);
+        uv.samples = vec![
+            Sample::new(0.0, 0.0, 0.0),
+            Sample::new(120.0, 2.0, 1.0),
+            Sample::new(240.0, 3.0, 0.5),
+        ];
+        Run {
+            meta: RunMeta::default(),
+            source_format: SourceFormat::NgcAnalysis,
+            source_path: std::path::PathBuf::from("test.ngcAnalysis"),
+            channels: vec![uv],
+            fractions: Vec::new(),
+            events: Vec::new(),
+            warnings: Vec::new(),
+        }
+    }
+
+    fn map_for(run: &Run, axis: XAxis) -> XMap<'_> {
+        let mut view = View::default();
+        view.adopt_run(run);
+        view.set_x_axis(axis);
+        XMap::new(run, &view)
+    }
+
+    #[test]
+    fn the_volume_axis_is_the_identity() {
+        let run = mapping_run();
+        let map = map_for(&run, XAxis::Volume);
+        assert_eq!(map.to_x(2.5), Some(2.5));
+        assert_eq!(map.to_volume(2.5), Some(2.5));
+        assert_eq!(map.to_volume_clamped(99.0), Some(99.0));
+        assert_eq!(map.to_volume(f32::NAN), None);
+    }
+
+    #[test]
+    fn the_time_axis_maps_overlays_through_the_reference_channel() {
+        let run = mapping_run();
+        let map = map_for(&run, XAxis::Time);
+        // 2.5 mL falls in the slow half, so it is 3 min in, not 2.5.
+        let x = map.to_x(2.5).expect("inside the run");
+        assert!((x - 3.0).abs() < 1e-4, "x = {x}");
+        let (a, b) = map.to_window(0.0, 2.0).expect("inside the run");
+        assert!((a - 0.0).abs() < 1e-4 && (b - 2.0).abs() < 1e-4, "{a}..{b}");
+    }
+
+    #[test]
+    fn a_trace_reads_its_own_time_base_rather_than_being_interpolated() {
+        let run = mapping_run();
+        let map = map_for(&run, XAxis::Time);
+        // 90 s is 1.5 min whatever the reference channel says about volume.
+        assert_eq!(map.sample_x(&Sample::new(90.0, 0.4, 0.0)), 1.5);
+        let x = map_for(&run, XAxis::Volume).sample_x(&Sample::new(90.0, 0.4, 0.0));
+        assert!((x - 0.4).abs() < 1e-6, "x = {x}");
+    }
+
+    #[test]
+    fn a_drag_in_minutes_becomes_the_volume_window_the_user_pointed_at() {
+        // The regression this whole feature risks: integrating in time mode must
+        // hand `integrate_peak` mL, and the mL the pointer was actually over.
+        let run = mapping_run();
+        let map = map_for(&run, XAxis::Time);
+        let v0 = map.to_volume_clamped(1.0).expect("inside the run");
+        let v1 = map.to_volume_clamped(3.0).expect("inside the run");
+        assert!((v0 - 1.0).abs() < 1e-4, "v0 = {v0}");
+        assert!((v1 - 2.5).abs() < 1e-4, "v1 = {v1}");
+    }
+
+    #[test]
+    fn a_drag_past_the_end_of_the_run_integrates_to_the_end_of_the_run() {
+        let run = mapping_run();
+        let map = map_for(&run, XAxis::Time);
+        assert_eq!(map.to_volume_clamped(99.0), Some(3.0));
+        assert_eq!(map.to_volume_clamped(-5.0), Some(0.0));
+        // Hover stays strict: past the data is not "at the last fraction".
+        assert_eq!(map.to_volume(99.0), None);
+    }
+
+    #[test]
+    fn overlays_are_pinned_to_the_ends_rather_than_disappearing() {
+        // A fraction that closes just after the last UV sample must still draw.
+        let run = mapping_run();
+        let map = map_for(&run, XAxis::Time);
+        let (a, b) = map.to_window(2.5, 3.5).expect("clamped, not dropped");
+        assert!((a - 3.0).abs() < 1e-4, "a = {a}");
+        assert!((b - 4.0).abs() < 1e-4, "b = {b}");
+    }
+
+    #[test]
+    fn a_run_without_samples_maps_nothing_instead_of_panicking() {
+        let mut run = mapping_run();
+        run.channels[0].samples.clear();
+        let map = map_for(&run, XAxis::Time);
+        assert!(map.reference.is_none());
+        assert_eq!(map.to_x(1.0), None);
+        assert_eq!(map.to_volume(1.0), None);
+        assert_eq!(map.to_volume_clamped(1.0), None);
+        assert_eq!(map.counterpart(1.0), None);
+    }
+
+    #[test]
+    fn the_hover_readout_names_its_unit_and_keeps_the_other_one_in_view() {
+        let run = mapping_run();
+        let volume = map_for(&run, XAxis::Volume);
+        let label = hover_label(
+            &run,
+            &[],
+            "",
+            XAxis::Volume,
+            2.5,
+            0.75,
+            volume.counterpart(2.5),
+        );
+        assert_eq!(label, "2.500 mL\n3.000 min\n0.750");
+
+        let time = map_for(&run, XAxis::Time);
+        let label = hover_label(&run, &[], "", XAxis::Time, 3.0, 0.75, time.counterpart(3.0));
+        assert_eq!(label, "3.000 min\n2.500 mL\n0.750");
+
+        // Off the ends of the data the secondary line is dropped rather than
+        // invented.
+        let label = hover_label(
+            &run,
+            &[],
+            "",
+            XAxis::Volume,
+            9.0,
+            0.1,
+            volume.counterpart(9.0),
+        );
+        assert_eq!(label, "9.000 mL\n0.100");
+    }
+
+    #[test]
+    fn the_time_axis_still_names_the_fraction_and_peak_under_the_pointer() {
+        // The fraction and peak lines are looked up in mL, so they must survive
+        // the pointer being reported in minutes.
+        let mut run = mapping_run();
+        run.fractions = vec![fraction(1, Some(Well::new(0, 0)), 2.4, 2.6)];
+        let map = map_for(&run, XAxis::Time);
+        let peaks = hover_peaks(&run, &[peak(2, "MWave2", 2.4, 2.6)], AxisGroup::Uv);
+
+        // 3 min is 2.5 mL, inside both windows.
+        let label = hover_label(
+            &run,
+            &peaks,
+            "mAU",
+            XAxis::Time,
+            3.0,
+            0.75,
+            map.counterpart(3.0),
+        );
+        assert_eq!(label, "3.000 min\n2.500 mL\n0.750 mAU\nFraction A1\nPeak 2");
+
+        // Past the data there is no volume to look anything up with, so neither
+        // line is invented.
+        let label = hover_label(
+            &run,
+            &peaks,
+            "mAU",
+            XAxis::Time,
+            99.0,
+            0.1,
+            map.counterpart(99.0),
+        );
+        assert_eq!(label, "99.000 min\n0.100 mAU");
+    }
+
+    // --- y transform ------------------------------------------------------
+
+    #[test]
+    fn the_y_map_is_exactly_the_identity_for_now() {
+        // Exact equality, not an epsilon: the placeholder must introduce no
+        // arithmetic at all, so today's rendering is bit-identical to the code
+        // before `PlotTransform` existed. `feat/multi-y-scales` replaces the body
+        // of `YMap::apply`; when it does, this test is the one to rewrite.
+        for y in [
+            0.0f64,
+            -0.0,
+            1.0,
+            -412.6,
+            f64::MIN_POSITIVE,
+            f64::MAX,
+            0.1 + 0.2,
+        ] {
+            assert!(
+                YMap::IDENTITY.apply(y) == y,
+                "y = {y} came back as {}",
+                YMap::IDENTITY.apply(y)
+            );
+        }
+        assert!(YMap::IDENTITY.apply(f64::NAN).is_nan());
+
+        // The extent hook is likewise exactly pass-through, so overlays are still
+        // sized from `data_y_range` and nothing re-enters the plot's auto-bounds.
+        let data = data_y_range(&[]);
+        assert!(YMap::IDENTITY.extent(data) == data);
+        assert!(YMap::IDENTITY.extent((-412.6, 1e300)) == (-412.6, 1e300));
+
+        assert_eq!(PlotTransform::new(&mapping_run(), &View::default()).y, YMap);
     }
 }

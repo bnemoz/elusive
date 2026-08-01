@@ -155,6 +155,67 @@ pub fn restore_order(saved: &[String]) -> Vec<PanelId> {
     order
 }
 
+/// Which quantity the chromatogram's x-axis shows.
+///
+/// Display only. Everything stored — peaks, excluded regions, annotations, the
+/// sidecar — stays in mL, because elution volume is the physically meaningful
+/// axis for prep SEC and a saved analysis must not depend on a view preference.
+/// `DESIGN_SYSTEM.md` §10.1 keeps volume as the axis and time as a secondary
+/// readout; this makes the secondary readout promotable for users who think in
+/// method minutes without moving the model under them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum XAxis {
+    Volume,
+    Time,
+}
+
+impl XAxis {
+    pub const ALL: [XAxis; 2] = [XAxis::Volume, XAxis::Time];
+
+    /// Full axis title.
+    pub fn label(self) -> &'static str {
+        match self {
+            XAxis::Volume => "Elution volume (mL)",
+            XAxis::Time => "Elution time (min)",
+        }
+    }
+
+    /// Unit suffix, also short enough to label the toolbar toggle.
+    pub fn unit(self) -> &'static str {
+        match self {
+            XAxis::Volume => "mL",
+            XAxis::Time => "min",
+        }
+    }
+
+    /// The axis *not* selected, i.e. the one shown as a secondary hover readout.
+    pub fn other(self) -> XAxis {
+        match self {
+            XAxis::Volume => XAxis::Time,
+            XAxis::Time => XAxis::Volume,
+        }
+    }
+
+    /// Stable sidecar key. Kept separate from `unit()` so renaming a label can
+    /// never invalidate saved files.
+    pub fn key(self) -> &'static str {
+        match self {
+            XAxis::Volume => "volume",
+            XAxis::Time => "time",
+        }
+    }
+
+    /// `None` for an unrecognised key, so a sidecar written by a future build
+    /// with a third axis mode degrades to the default instead of failing.
+    pub fn from_key(key: &str) -> Option<XAxis> {
+        match key {
+            "volume" => Some(XAxis::Volume),
+            "time" => Some(XAxis::Time),
+            _ => None,
+        }
+    }
+}
+
 /// Which baseline the next integration will use.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum BaselineChoice {
@@ -252,6 +313,10 @@ pub struct View {
     /// Overview card order, left-to-right then top-to-bottom through the columns.
     pub overview_order: Vec<PanelId>,
 
+    /// Display axis for the chromatogram. Never consulted by anything that
+    /// computes or stores a result — see [`XAxis`].
+    pub x_axis: XAxis,
+
     // --- linked hover state (Phase 4) ---
     pub hovered_vol_range: Option<(f32, f32)>,
     pub hovered_well: Option<Well>,
@@ -299,6 +364,7 @@ impl Default for View {
             show_fractions: true,
             overview_order: PanelId::ALL.to_vec(),
             channel_colors: BTreeMap::new(),
+            x_axis: XAxis::Volume,
             hovered_vol_range: None,
             hovered_well: None,
             hovered_volume: None,
@@ -465,6 +531,20 @@ impl View {
         }
     }
 
+    /// Switch the chromatogram's display axis.
+    ///
+    /// Any in-flight drag selection is dropped: it was measured in the old axis'
+    /// units, and reinterpreting those numbers as the new unit would hand the
+    /// integrator a window the user never drew.
+    pub fn set_x_axis(&mut self, axis: XAxis) {
+        if self.x_axis != axis {
+            self.x_axis = axis;
+            self.pending_selection = None;
+            self.drag_anchor = None;
+            self.dirty = true;
+        }
+    }
+
     pub fn set_plate_channel(&mut self, channel: Option<ChannelId>) {
         if self.plate_channel != channel {
             self.plate_channel = channel;
@@ -577,6 +657,7 @@ impl View {
                     .map(|(id, color)| (id.0.clone(), *color))
                     .collect(),
             ),
+            x_axis: Some(self.x_axis.key().to_string()),
         };
         sidecar
     }
@@ -663,6 +744,11 @@ impl View {
                 .filter(|(id, _)| run.channels.iter().any(|c| c.id.0 == **id))
                 .map(|(id, color)| (ChannelId(id.clone()), *color))
                 .collect();
+        }
+        // An unknown key leaves the default in place rather than reporting a
+        // problem: the axis is a preference, not part of the analysis.
+        if let Some(axis) = sidecar.view.x_axis.as_deref().and_then(XAxis::from_key) {
+            self.x_axis = axis;
         }
 
         self.dirty = false;
@@ -758,6 +844,7 @@ mod tests {
             &ChannelId::from("MWave2"),
             Color::new(0xC4, 0x77, 0x3D, 0xFF),
         );
+        view.set_x_axis(XAxis::Time);
         let peak_id = view.allocate_peak_id();
         view.add_peak(PeakResult {
             id: peak_id,
@@ -786,6 +873,7 @@ mod tests {
             restored.channel_color(&ChannelId::from("MWave2")),
             Some(Color::new(0xC4, 0x77, 0x3D, 0xFF))
         );
+        assert_eq!(restored.x_axis, XAxis::Time);
         assert!(!restored.dirty, "a freshly loaded sidecar is not dirty");
     }
 
@@ -848,6 +936,35 @@ mod tests {
         view.dirty = false;
         view.clear_channel_color(&id);
         assert!(!view.dirty);
+    }
+
+    #[test]
+    fn a_sidecar_without_an_axis_preference_still_loads() {
+        // Files written before the toggle existed have no `x_axis` key; they must
+        // deserialize and fall back to the volume default.
+        let run = test_run();
+        let sidecar = Sidecar::for_run(&run);
+        assert_eq!(sidecar.view.x_axis, None);
+
+        let mut view = View::default();
+        view.set_x_axis(XAxis::Time);
+        view.apply_sidecar(&sidecar, &run);
+        assert_eq!(view.x_axis, XAxis::Time, "an absent key changes nothing");
+
+        assert_eq!(XAxis::from_key("who knows"), None);
+    }
+
+    #[test]
+    fn switching_the_axis_drops_a_selection_measured_in_the_old_unit() {
+        let mut view = View {
+            pending_selection: Some((1.0, 2.0)),
+            drag_anchor: Some(1.0),
+            ..View::default()
+        };
+        view.set_x_axis(XAxis::Time);
+        assert_eq!(view.pending_selection, None);
+        assert_eq!(view.drag_anchor, None);
+        assert!(view.dirty);
     }
 
     #[test]

@@ -106,6 +106,14 @@ pub struct ViewState {
     /// colour a future merge might want to keep.
     #[serde(default)]
     pub channel_colors: Option<BTreeMap<String, Color>>,
+    /// Which quantity the chromatogram's x-axis was showing, as a stable key
+    /// (`"volume"` / `"time"`).
+    ///
+    /// A string rather than an enum on purpose: this is a pure UI preference that
+    /// core has no other use for, and an unrecognised key can be ignored by an
+    /// older or newer build without failing the whole sidecar.
+    #[serde(default)]
+    pub x_axis: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

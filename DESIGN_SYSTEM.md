@@ -152,6 +152,15 @@ possible; the one new token group (`plate`) is named and purpose-documented per 
 - The chromatogram x-axis is **elution volume (mL)**, not retention time. Where §4
   says "retention time," read **elution volume (Ve)**; keep time available as a
   secondary readout. Numeric fields still use tabular numerals, right-aligned (§2).
+
+  *Extended in 0.2.0.* A toolbar toggle (`mL` / `min`) can promote elution time to
+  the x-axis, and the hover readout then shows the volume as its secondary line —
+  the pair is symmetric, only the default differs. This is a **display transform
+  only**: peaks, excluded regions, fraction windows and the sidecar remain in mL,
+  because volume is the physically meaningful axis for prep SEC and a saved
+  analysis must not depend on a view preference. Anything an interaction produces
+  (notably a drag-to-integrate window) is converted back to mL before it leaves
+  the chart.
 - Peak labels remain `P1, P2, …` (§4). SEC size results add an **estimated MW** field
   derived from the calibration curve; concentration is a separate A280 field.
 

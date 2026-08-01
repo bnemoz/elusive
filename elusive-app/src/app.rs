@@ -8,7 +8,7 @@
 use crate::egui_adapter::{self as adapt, c, Mode};
 use crate::export_image;
 use crate::theme::{color, measure, spacing, Theme};
-use crate::view::{BaselineChoice, Interaction, Section, View};
+use crate::view::{BaselineChoice, Interaction, Section, View, XAxis};
 use crate::widgets::{self, chromatogram, panels, plate};
 use elusive_core::integrate::{integrate_peak, PlateMetric};
 use elusive_core::model::Run;
@@ -600,6 +600,27 @@ impl EluSiveApp {
                         let mut show_fractions = self.view.show_fractions;
                         if ui.checkbox(&mut show_fractions, "Fraction zones").changed() {
                             self.view.set_show_fractions(show_fractions);
+                        }
+
+                        ui.separator();
+
+                        // Two selectable labels rather than a combo: with only two
+                        // values, both options stay readable and the current one is
+                        // one click away, and the unit itself is the label so the
+                        // control says what the axis will read.
+                        ui.label(
+                            egui::RichText::new("X axis")
+                                .font(adapt::font_micro())
+                                .color(c(t.text_secondary)),
+                        );
+                        for axis in XAxis::ALL {
+                            let selected = self.view.x_axis == axis;
+                            let hit = ui
+                                .selectable_label(selected, axis.unit())
+                                .on_hover_text(axis.label());
+                            if hit.clicked() {
+                                self.view.set_x_axis(axis);
+                            }
                         }
                     });
 
