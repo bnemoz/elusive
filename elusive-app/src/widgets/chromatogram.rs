@@ -49,9 +49,14 @@ pub fn show(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) -> ChartOutcome {
     let mut outcome = ChartOutcome::default();
     let total = ui.available_height();
     let heights = group_heights(&groups, total);
+    let count = groups.len();
 
     for (idx, (group, height)) in groups.iter().zip(heights).enumerate() {
-        let (interaction, hovered) = plot_group(ui, run, view, t, *group, height, idx == 0);
+        let position = PlotPosition {
+            is_hero: idx == 0,
+            x_axis_label: x_axis_label_for(idx, count),
+        };
+        let (interaction, hovered) = plot_group(ui, run, view, t, *group, height, position);
         if interaction.is_some() {
             outcome.interaction = interaction;
         }
@@ -62,6 +67,32 @@ pub fn show(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) -> ChartOutcome {
         }
     }
     outcome
+}
+
+/// Where a plot sits in the stack, and what that implies for its chrome.
+///
+/// `is_hero` (top plot, own y-axis overlays) and the x-axis label (bottom plot
+/// only) are both derived from a plot's position but are otherwise unrelated,
+/// so they are bundled here rather than passed as two more bare `plot_group`
+/// arguments.
+#[derive(Clone, Copy)]
+struct PlotPosition {
+    is_hero: bool,
+    x_axis_label: &'static str,
+}
+
+/// The x-axis label for the plot at `idx` in a stack of `count` plots.
+///
+/// The stack is x-linked, so repeating "Elution volume (mL)" under every plot
+/// is clutter — but it still has to appear *somewhere*, including in the
+/// overwhelmingly common single-group (UV-only) view. Only the bottom-most
+/// plot gets it.
+fn x_axis_label_for(idx: usize, count: usize) -> &'static str {
+    if count > 0 && idx == count - 1 {
+        "Elution volume (mL)"
+    } else {
+        ""
+    }
 }
 
 /// Axis groups that currently have at least one visible channel, hero group first.
@@ -145,8 +176,12 @@ fn plot_group(
     t: Theme,
     group: AxisGroup,
     height: f32,
-    is_hero: bool,
+    position: PlotPosition,
 ) -> (Option<Interaction>, Option<f32>) {
+    let PlotPosition {
+        is_hero,
+        x_axis_label,
+    } = position;
     let channels: Vec<(usize, &Channel)> = run
         .channels
         .iter()
@@ -182,7 +217,7 @@ fn plot_group(
             // plot — unreadable peak heights on the one trace that matters.
             .label_spacing(egui::Rangef::new(12.0, 20.0))
             .min_thickness(44.0)])
-        .x_axis_label(if is_hero { "" } else { "Elution volume (mL)" })
+        .x_axis_label(x_axis_label)
         .legend(egui_plot::Legend::default().position(egui_plot::Corner::RightTop))
         .label_formatter(|pos| {
             let p = match pos {
@@ -631,5 +666,20 @@ mod tests {
     fn an_empty_group_still_yields_a_usable_extent() {
         let (lo, hi) = data_y_range(&[]);
         assert!(hi > lo, "a degenerate range would make overlays invisible");
+    }
+
+    #[test]
+    fn a_single_group_view_still_gets_the_x_axis_label() {
+        // Regression: this is the overwhelmingly common UV-only view. The old
+        // `is_hero` check blanked the label here because the one plot is both
+        // the hero and the bottom of the stack.
+        assert_eq!(x_axis_label_for(0, 1), "Elution volume (mL)");
+    }
+
+    #[test]
+    fn a_stacked_view_labels_only_the_bottom_plot() {
+        assert_eq!(x_axis_label_for(0, 3), "");
+        assert_eq!(x_axis_label_for(1, 3), "");
+        assert_eq!(x_axis_label_for(2, 3), "Elution volume (mL)");
     }
 }
