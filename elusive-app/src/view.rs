@@ -272,10 +272,41 @@ impl View {
     }
 
     pub fn set_channel_visible(&mut self, id: &ChannelId, visible: bool) {
-        if visible {
-            self.hidden_channels.remove(id);
+        let changed = if visible {
+            self.hidden_channels.remove(id)
         } else {
-            self.hidden_channels.insert(id.clone());
+            self.hidden_channels.insert(id.clone())
+        };
+        if changed {
+            self.dirty = true;
+        }
+    }
+
+    pub fn set_show_fractions(&mut self, show: bool) {
+        if self.show_fractions != show {
+            self.show_fractions = show;
+            self.dirty = true;
+        }
+    }
+
+    pub fn set_plate_channel(&mut self, channel: Option<ChannelId>) {
+        if self.plate_channel != channel {
+            self.plate_channel = channel;
+            self.dirty = true;
+        }
+    }
+
+    pub fn set_plate_metric(&mut self, metric: PlateMetric) {
+        if self.plate_metric != metric {
+            self.plate_metric = metric;
+            self.dirty = true;
+        }
+    }
+
+    pub fn set_plate_uniform_ramp(&mut self, enabled: bool) {
+        if self.plate_uniform_ramp != enabled {
+            self.plate_uniform_ramp = enabled;
+            self.dirty = true;
         }
     }
 
@@ -343,6 +374,8 @@ impl View {
             dark_mode: None,
             plate_channel: self.plate_channel.as_ref().map(|c| c.0.clone()),
             plate_metric: Some(self.plate_metric),
+            show_fractions: Some(self.show_fractions),
+            plate_uniform_ramp: Some(self.plate_uniform_ramp),
         };
         sidecar
     }
@@ -379,6 +412,16 @@ impl View {
                 self.vt_ml = vt_ml;
             }
             self.calibration = Some(named.calibration.clone());
+            for peak in &mut self.peaks {
+                peak.estimated_mw_kda = run
+                    .channel(&peak.channel_id)
+                    .filter(|channel| channel.kind == elusive_core::model::ChannelKind::Uv)
+                    .and_then(|_| named.calibration.mw_for_volume(peak.apex_volume_ml));
+            }
+        } else {
+            for peak in &mut self.peaks {
+                peak.estimated_mw_kda = None;
+            }
         }
 
         if !sidecar.view.visible_channels.is_empty() {
@@ -397,6 +440,12 @@ impl View {
         }
         if let Some(metric) = sidecar.view.plate_metric {
             self.plate_metric = metric;
+        }
+        if let Some(show) = sidecar.view.show_fractions {
+            self.show_fractions = show;
+        }
+        if let Some(enabled) = sidecar.view.plate_uniform_ramp {
+            self.plate_uniform_ramp = enabled;
         }
 
         self.dirty = false;
@@ -484,7 +533,9 @@ mod tests {
         let run = test_run();
         let mut view = View::default();
         view.adopt_run(&run);
-        view.plate_metric = PlateMetric::MaxValue;
+        view.set_plate_metric(PlateMetric::MaxValue);
+        view.set_show_fractions(false);
+        view.set_plate_uniform_ramp(true);
         let peak_id = view.allocate_peak_id();
         view.add_peak(PeakResult {
             id: peak_id,
@@ -506,6 +557,8 @@ mod tests {
         assert!(notes.is_empty());
         assert_eq!(restored.peaks.len(), 1);
         assert_eq!(restored.plate_metric, PlateMetric::MaxValue);
+        assert!(!restored.show_fractions);
+        assert!(restored.plate_uniform_ramp);
         assert!(!restored.dirty, "a freshly loaded sidecar is not dirty");
     }
 

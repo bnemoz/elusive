@@ -79,21 +79,40 @@ impl EluSiveApp {
                 if sidecar_path.is_file() {
                     match sidecar::load(&sidecar_path) {
                         Ok(s) => {
-                            let notes = self.view.apply_sidecar(&s, &run);
-                            for n in notes {
-                                self.note(ctx, n);
+                            if s.matches(&run) {
+                                let notes = self.view.apply_sidecar(&s, &run);
+                                for n in notes {
+                                    self.note(ctx, n);
+                                }
+                                self.mode = match s.view.dark_mode {
+                                    Some(true) => Mode::Dark,
+                                    Some(false) => Mode::Light,
+                                    None => Mode::System,
+                                };
+                                self.styled = false;
+                                self.note(
+                                    ctx,
+                                    format!(
+                                        "Restored {} saved integration(s) from {}",
+                                        self.view.peaks.len(),
+                                        sidecar_path
+                                            .file_name()
+                                            .map(|s| s.to_string_lossy().into_owned())
+                                            .unwrap_or_default()
+                                    ),
+                                );
+                            } else {
+                                self.note(
+                                    ctx,
+                                    format!(
+                                        "Skipped {} because it does not match this run",
+                                        sidecar_path
+                                            .file_name()
+                                            .map(|s| s.to_string_lossy().into_owned())
+                                            .unwrap_or_default()
+                                    ),
+                                );
                             }
-                            self.note(
-                                ctx,
-                                format!(
-                                    "Restored {} saved integration(s) from {}",
-                                    self.view.peaks.len(),
-                                    sidecar_path
-                                        .file_name()
-                                        .map(|s| s.to_string_lossy().into_owned())
-                                        .unwrap_or_default()
-                                ),
-                            );
                         }
                         Err(e) => self.note(ctx, format!("Could not read the sidecar: {e}")),
                     }
@@ -117,7 +136,12 @@ impl EluSiveApp {
     fn save_sidecar(&mut self, ctx: &egui::Context) {
         let Some(run) = &self.run else { return };
         let path = run.sidecar_path();
-        let payload = self.view.to_sidecar(run);
+        let mut payload = self.view.to_sidecar(run);
+        payload.view.dark_mode = match self.mode {
+            Mode::Dark => Some(true),
+            Mode::Light => Some(false),
+            Mode::System => None,
+        };
         match sidecar::save(&path, &payload) {
             Ok(()) => {
                 self.view.dirty = false;
@@ -175,8 +199,12 @@ impl EluSiveApp {
                 let baseline = self.view.baseline_choice.resolve(v0, v1);
                 match integrate_peak(id, channel, v0, v1, baseline) {
                     Ok(mut peak) => {
-                        if let Some(cal) = &self.view.calibration {
+                        if let Some(cal) = &self.view.calibration
+                            && channel.kind == elusive_core::model::ChannelKind::Uv
+                        {
                             peak.estimated_mw_kda = cal.mw_for_volume(peak.apex_volume_ml);
+                        } else {
+                            peak.estimated_mw_kda = None;
                         }
                         let summary = format!(
                             "Integrated {} on {}: area {:.2} {}·mL",
@@ -313,7 +341,10 @@ impl EluSiveApp {
                                     );
                                 }
                             });
-                        ui.checkbox(&mut self.view.show_fractions, "Fraction ticks");
+                        let mut show_fractions = self.view.show_fractions;
+                        if ui.checkbox(&mut show_fractions, "Fraction ticks").changed() {
+                            self.view.set_show_fractions(show_fractions);
+                        }
                     });
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -326,6 +357,7 @@ impl EluSiveApp {
                                         .clicked()
                                     {
                                         self.styled = false;
+                                        self.view.dirty = true;
                                     }
                                 }
                             });
@@ -537,13 +569,19 @@ fn linked_pane(ui: &mut egui::Ui, run: &Run, view: &mut View, t: Theme) -> Optio
             ui.horizontal(|ui| {
                 panels::heading(ui, t, "HEP96 plate");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.checkbox(&mut view.plate_uniform_ramp, "Uniform ramp");
+                    let mut uniform_ramp = view.plate_uniform_ramp;
+                    if ui.checkbox(&mut uniform_ramp, "Uniform ramp").changed() {
+                        view.set_plate_uniform_ramp(uniform_ramp);
+                    }
 
                     egui::ComboBox::from_id_salt("plate-metric")
                         .selected_text(view.plate_metric.label())
                         .show_ui(ui, |ui| {
                             for metric in PlateMetric::ALL {
-                                ui.selectable_value(&mut view.plate_metric, metric, metric.label());
+                                let selected = view.plate_metric == metric;
+                                if ui.selectable_label(selected, metric.label()).clicked() {
+                                    view.set_plate_metric(metric);
+                                }
                             }
                         });
 
@@ -559,7 +597,7 @@ fn linked_pane(ui: &mut egui::Ui, run: &Run, view: &mut View, t: Theme) -> Optio
                             for channel in run.channels.iter().filter(|c| !c.is_empty()) {
                                 let selected = view.plate_channel.as_ref() == Some(&channel.id);
                                 if ui.selectable_label(selected, &channel.name).clicked() {
-                                    view.plate_channel = Some(channel.id.clone());
+                                    view.set_plate_channel(Some(channel.id.clone()));
                                 }
                             }
                         });

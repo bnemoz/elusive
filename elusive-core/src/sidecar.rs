@@ -82,6 +82,10 @@ pub struct ViewState {
     pub plate_channel: Option<String>,
     #[serde(default)]
     pub plate_metric: Option<PlateMetric>,
+    #[serde(default)]
+    pub show_fractions: Option<bool>,
+    #[serde(default)]
+    pub plate_uniform_ramp: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -150,6 +154,7 @@ impl Sidecar {
             .and_then(|s| s.to_str())
             .unwrap_or_default();
         self.source.file_name == name
+            && (self.source.run_name.is_empty() || self.source.run_name == run.meta.run_name)
     }
 }
 
@@ -380,6 +385,28 @@ mod tests {
     fn malformed_json_reports_a_sidecar_error_not_a_panic() {
         assert!(matches!(from_json("{not json"), Err(Error::Sidecar { .. })));
         assert!(matches!(from_json("{}"), Err(Error::Sidecar { .. })));
+    }
+
+    #[test]
+    fn sidecar_identity_requires_matching_file_name_and_run_name() {
+        let mut run = Run {
+            meta: crate::model::RunMeta {
+                run_name: "run-a".into(),
+                ..crate::model::RunMeta::default()
+            },
+            source_format: crate::model::SourceFormat::NgcAnalysis,
+            source_path: PathBuf::from("run-a.ngcAnalysis"),
+            channels: Vec::new(),
+            fractions: Vec::new(),
+            events: Vec::new(),
+            warnings: Vec::new(),
+        };
+
+        let sidecar = Sidecar::for_run(&run);
+        assert!(sidecar.matches(&run));
+
+        run.meta.run_name = "run-b".into();
+        assert!(!sidecar.matches(&run));
     }
 
     #[test]

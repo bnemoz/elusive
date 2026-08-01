@@ -8,7 +8,7 @@ use crate::theme::{color, spacing, Theme};
 use crate::view::View;
 use egui::Ui;
 use elusive_core::calibration::{self, FitBasis, BIORAD_GFS, LOW_CONFIDENCE_R2};
-use elusive_core::model::{PeakId, Run};
+use elusive_core::model::{Channel, PeakId, PeakResult, Run};
 
 /// Section heading inside a card.
 pub fn heading(ui: &mut Ui, t: Theme, text: &str) {
@@ -384,7 +384,7 @@ pub fn peak_detail(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) {
             .map(|v| num(v as f64, 3))
             .unwrap_or_else(|| "not resolved".to_string()),
     );
-    if let Some(mw) = peak.estimated_mw_kda {
+    if let Some(mw) = estimated_mw_for_peak(run, &peak, view.calibration.as_ref()) {
         field(ui, t, "Estimated MW (kDa)", &num(mw, 1));
     }
 
@@ -485,6 +485,7 @@ pub fn calibration_panel(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) {
         if ui.button("Clear assignment").clicked() {
             view.cal_points.clear();
             view.calibration = None;
+            clear_peak_mw(view);
             view.dirty = true;
         }
     });
@@ -533,20 +534,26 @@ pub fn calibration_panel(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) {
 
     ui.add_space(spacing::MD);
     ui.horizontal(|ui| {
-        ui.checkbox(&mut view.use_kav, "Fit against Kav");
+        if ui.checkbox(&mut view.use_kav, "Fit against Kav").changed() {
+            view.dirty = true;
+        }
         if view.use_kav {
             ui.label(
                 egui::RichText::new("V0 (mL)")
                     .font(font_micro())
                     .color(c(t.text_secondary)),
             );
-            ui.add(egui::DragValue::new(&mut view.v0_ml).speed(0.01));
+            if ui.add(egui::DragValue::new(&mut view.v0_ml).speed(0.01)).changed() {
+                view.dirty = true;
+            }
             ui.label(
                 egui::RichText::new("Vt (mL)")
                     .font(font_micro())
                     .color(c(t.text_secondary)),
             );
-            ui.add(egui::DragValue::new(&mut view.vt_ml).speed(0.01));
+            if ui.add(egui::DragValue::new(&mut view.vt_ml).speed(0.01)).changed() {
+                view.dirty = true;
+            }
         }
     });
     if view.use_kav && run.meta.v0_ml.is_none() {
@@ -577,12 +584,13 @@ pub fn calibration_panel(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) {
             .collect();
         match calibration::fit(&usable, basis) {
             Ok(cal) => {
-                apply_calibration_to_peaks(view, &cal);
+                apply_calibration_to_peaks(run, view, &cal);
                 view.calibration = Some(cal);
                 view.dirty = true;
             }
             Err(e) => {
                 view.calibration = None;
+                clear_peak_mw(view);
                 ui.label(egui::RichText::new(e.to_string()).color(c(color::DANGER_600)));
             }
         }
@@ -610,7 +618,7 @@ pub fn calibration_panel(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) {
     }
 
     ui.add_space(spacing::XL);
-    concentration_panel(ui, view, t);
+    concentration_panel(ui, run, view, t);
 }
 
 fn set_cal_point(view: &mut View, mw_kda: f64, ve_ml: f32) {
@@ -629,20 +637,40 @@ fn set_cal_point(view: &mut View, mw_kda: f64, ve_ml: f32) {
 }
 
 /// Stamp estimated MWs onto every peak the curve can speak to.
-pub fn apply_calibration_to_peaks(view: &mut View, cal: &calibration::Calibration) {
+pub fn apply_calibration_to_peaks(run: &Run, view: &mut View, cal: &calibration::Calibration) {
     for peak in view.peaks.iter_mut() {
-        peak.estimated_mw_kda = cal.mw_for_volume(peak.apex_volume_ml);
+        peak.estimated_mw_kda = if peak_supports_mw(run, peak) {
+            cal.mw_for_volume(peak.apex_volume_ml)
+        } else {
+            None
+        };
+    }
+}
+
+fn clear_peak_mw(view: &mut View) {
+    for peak in &mut view.peaks {
+        peak.estimated_mw_kda = None;
     }
 }
 
 /// Beer–Lambert concentration from a peak's A280 apex — deliberately a separate
 /// card from size, because they answer different questions (`design.md` §10).
-fn concentration_panel(ui: &mut Ui, view: &mut View, t: Theme) {
+fn concentration_panel(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) {
     heading(ui, t, "Concentration from A280");
 
     ui.horizontal(|ui| {
-        ui.selectable_value(&mut view.concentration.use_molar, false, "A(1%) / mg·mL⁻¹");
-        ui.selectable_value(&mut view.concentration.use_molar, true, "Molar ε");
+        if ui
+            .selectable_value(&mut view.concentration.use_molar, false, "A(1%) / mg·mL⁻¹")
+            .changed()
+        {
+            view.dirty = true;
+        }
+        if ui
+            .selectable_value(&mut view.concentration.use_molar, true, "Molar ε")
+            .changed()
+        {
+            view.dirty = true;
+        }
     });
 
     if view.concentration.use_molar {
@@ -652,13 +680,23 @@ fn concentration_panel(ui: &mut Ui, view: &mut View, t: Theme) {
                     .font(font_micro())
                     .color(c(t.text_secondary)),
             );
-            ui.add(egui::DragValue::new(&mut view.concentration.epsilon_molar).speed(10.0));
+            if ui
+                .add(egui::DragValue::new(&mut view.concentration.epsilon_molar).speed(10.0))
+                .changed()
+            {
+                view.dirty = true;
+            }
             ui.label(
                 egui::RichText::new("MW (Da)")
                     .font(font_micro())
                     .color(c(t.text_secondary)),
             );
-            ui.add(egui::DragValue::new(&mut view.concentration.mw_da).speed(100.0));
+            if ui
+                .add(egui::DragValue::new(&mut view.concentration.mw_da).speed(100.0))
+                .changed()
+            {
+                view.dirty = true;
+            }
         });
     } else {
         ui.horizontal(|ui| {
@@ -667,11 +705,16 @@ fn concentration_panel(ui: &mut Ui, view: &mut View, t: Theme) {
                     .font(font_micro())
                     .color(c(t.text_secondary)),
             );
-            ui.add(
+            if ui
+                .add(
                 egui::DragValue::new(&mut view.concentration.e_mg_per_ml)
                     .speed(0.01)
                     .range(0.0001..=1000.0),
-            );
+                )
+                .changed()
+            {
+                view.dirty = true;
+            }
         });
     }
 
@@ -681,11 +724,16 @@ fn concentration_panel(ui: &mut Ui, view: &mut View, t: Theme) {
                 .font(font_micro())
                 .color(c(t.text_secondary)),
         );
-        ui.add(
+        if ui
+            .add(
             egui::DragValue::new(&mut view.concentration.path_length_cm)
                 .speed(0.01)
                 .range(0.0001..=10.0),
-        );
+            )
+            .changed()
+        {
+            view.dirty = true;
+        }
     });
 
     ui.add_space(spacing::SM);
@@ -697,6 +745,22 @@ fn concentration_panel(ui: &mut Ui, view: &mut View, t: Theme) {
             );
         }
         Some(peak) => {
+            let Some(channel) = run.channel(&peak.channel_id) else {
+                ui.label(
+                    egui::RichText::new("This peak's source channel is unavailable.")
+                        .color(c(color::WARNING_600)),
+                );
+                return;
+            };
+            if !peak_supports_a280(channel) {
+                ui.label(
+                    egui::RichText::new(
+                        "Concentration is only available for peaks integrated on UV 280 nm.",
+                    )
+                    .color(c(color::WARNING_600)),
+                );
+                return;
+            }
             // The peak height is in mAU; Beer–Lambert wants AU.
             let absorbance = calibration::au_from_mau(peak.height);
             field(ui, t, "Peak", &peak.id.to_string());
@@ -762,7 +826,7 @@ pub fn results_table(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) {
 
                 // An extrapolated size is labelled, because it is unsupported by
                 // the standards rather than merely imprecise.
-                let mw_text = match (&cal, peak.estimated_mw_kda) {
+                let mw_text = match (&cal, estimated_mw_for_peak(run, peak, cal.as_ref())) {
                     (Some(cal), Some(mw)) if cal.is_extrapolated(peak.apex_volume_ml) => {
                         format!("{} (extrapolated)", num(mw, 1))
                     }
@@ -771,15 +835,46 @@ pub fn results_table(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) {
                 };
                 ui.label(egui::RichText::new(mw_text).font(font_code()));
 
-                let conc = calibration::concentration_mg_per_ml(
-                    calibration::au_from_mau(peak.height),
-                    extinction,
-                    path,
-                )
-                .map(|v| num(v, 4))
-                .unwrap_or_else(|_| "—".to_string());
+                let conc = if peak_supports_a280_for_run(run, peak) {
+                    calibration::concentration_mg_per_ml(
+                        calibration::au_from_mau(peak.height),
+                        extinction,
+                        path,
+                    )
+                    .map(|v| num(v, 4))
+                    .unwrap_or_else(|_| "—".to_string())
+                } else {
+                    "—".to_string()
+                };
                 ui.label(egui::RichText::new(conc).font(font_code()));
                 ui.end_row();
             }
         });
+}
+
+fn peak_supports_mw(run: &Run, peak: &PeakResult) -> bool {
+    run.channel(&peak.channel_id)
+        .map(|channel| channel.kind == elusive_core::model::ChannelKind::Uv)
+        .unwrap_or(false)
+}
+
+fn peak_supports_a280(channel: &Channel) -> bool {
+    channel.kind == elusive_core::model::ChannelKind::Uv && channel.wavelength_nm == Some(280)
+}
+
+fn peak_supports_a280_for_run(run: &Run, peak: &PeakResult) -> bool {
+    run.channel(&peak.channel_id)
+        .map(peak_supports_a280)
+        .unwrap_or(false)
+}
+
+fn estimated_mw_for_peak(
+    run: &Run,
+    peak: &PeakResult,
+    calibration: Option<&calibration::Calibration>,
+) -> Option<f64> {
+    if !peak_supports_mw(run, peak) {
+        return None;
+    }
+    calibration.and_then(|cal| cal.mw_for_volume(peak.apex_volume_ml))
 }
