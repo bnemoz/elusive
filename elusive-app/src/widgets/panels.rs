@@ -38,6 +38,42 @@ pub fn field(ui: &mut Ui, t: Theme, label: &str, value: &str) {
     });
 }
 
+/// The header row of a data grid: 11 px secondary labels, one cell per column.
+///
+/// Shared so that every table in the app agrees on what a header looks like;
+/// callers still own the `Grid` itself, because column counts and interactivity
+/// differ from table to table.
+pub fn table_header_row(ui: &mut Ui, t: Theme, headers: &[&str]) {
+    for header in headers {
+        ui.label(
+            egui::RichText::new(*header)
+                .font(font_micro())
+                .color(c(t.text_secondary)),
+        );
+    }
+    ui.end_row();
+}
+
+/// A numeric grid cell, right-aligned inside a fixed-width box.
+///
+/// A grid cell sizes itself to its content, so `1234.5` and `9.0` start at the
+/// same left edge and the ones place drifts. Reserving a known width and laying
+/// out right-to-left inside it puts place value under place value (rule #4).
+fn num_cell(ui: &mut Ui, t: Theme, width: f32, text: &str) {
+    let height = ui.text_style_height(&egui::TextStyle::Monospace);
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, height),
+        egui::Layout::right_to_left(egui::Align::Center),
+        |ui| {
+            ui.label(
+                egui::RichText::new(text)
+                    .font(font_code())
+                    .color(c(t.text_primary)),
+            );
+        },
+    );
+}
+
 /// Run identity and provenance.
 pub fn run_summary(ui: &mut Ui, run: &Run, t: Theme) {
     heading(ui, t, "Run");
@@ -251,24 +287,21 @@ pub fn peak_table(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) {
                 .num_columns(9)
                 .spacing([spacing::LG, spacing::XS])
                 .show(ui, |ui| {
-                    for header in [
-                        "Peak",
-                        "Channel",
-                        "Ve (mL)",
-                        "Window (mL)",
-                        "Area",
-                        "Area %",
-                        "Height",
-                        "FWHM (mL)",
-                        "",
-                    ] {
-                        ui.label(
-                            egui::RichText::new(header)
-                                .font(font_micro())
-                                .color(c(t.text_secondary)),
-                        );
-                    }
-                    ui.end_row();
+                    table_header_row(
+                        ui,
+                        t,
+                        &[
+                            "Peak",
+                            "Channel",
+                            "Ve (mL)",
+                            "Window (mL)",
+                            "Area",
+                            "Area %",
+                            "Height",
+                            "FWHM (mL)",
+                            "",
+                        ],
+                    );
 
                     let peaks = view.peaks.clone();
                     for peak in &peaks {
@@ -333,6 +366,90 @@ pub fn peak_table(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) {
     if let Some(id) = to_delete {
         view.remove_peak(id);
     }
+}
+
+/// Columns of the peak export, in the order `sidecar::peaks_to_csv` writes them.
+const EXPORT_COLUMNS: [&str; 9] = [
+    "Peak",
+    "Channel",
+    "Start (mL)",
+    "End (mL)",
+    "Ve (mL)",
+    "Area",
+    "Height",
+    "FWHM (mL)",
+    "Est. MW (kDa)",
+];
+
+/// Reserved width per export column; `0.0` means "natural width, left aligned",
+/// which is what an identifier or a channel name wants.
+const EXPORT_WIDTHS: [f32; 9] = [0.0, 0.0, 60.0, 60.0, 60.0, 92.0, 92.0, 64.0, 80.0];
+
+/// The exported cells for one peak, at the precision the export writes.
+///
+/// Split out from the drawing code so the preview's agreement with
+/// `sidecar::peaks_to_csv` is a unit test rather than a promise. A value the run
+/// does not carry shows an em dash, never a zero that would read as a result.
+fn export_row(peak: &PeakResult) -> [String; EXPORT_COLUMNS.len()] {
+    [
+        peak.id.to_string(),
+        peak.channel_id.0.clone(),
+        num(peak.v_start_ml as f64, 4),
+        num(peak.v_end_ml as f64, 4),
+        num(peak.apex_volume_ml as f64, 4),
+        num(peak.area, 6),
+        num(peak.height, 6),
+        peak.fwhm_ml
+            .map(|v| num(v as f64, 4))
+            .unwrap_or_else(|| "—".to_string()),
+        peak.estimated_mw_kda
+            .map(|v| num(v, 3))
+            .unwrap_or_else(|| "—".to_string()),
+    ]
+}
+
+/// How tall the Reports preview may grow before it scrolls.
+///
+/// Bounded on purpose: a run with thirty peaks must not push the Sidecar section
+/// below the fold.
+const EXPORT_PREVIEW_MAX_HEIGHT: f32 = 200.0;
+
+/// A read-only preview of the peak export.
+///
+/// Same columns and same decimals as the CSV and Markdown writers, so the user is
+/// reading the file rather than a paraphrase of it. No zebra striping: §"Data
+/// tables" reserves row fill for selection, and nothing here is selectable.
+pub fn peak_export_preview(ui: &mut Ui, view: &View, t: Theme) {
+    if view.peaks.is_empty() {
+        ui.label(egui::RichText::new("No integrations to export yet.").color(c(t.text_secondary)));
+        return;
+    }
+
+    egui::ScrollArea::both()
+        .id_salt("peak-export-preview")
+        .max_height(EXPORT_PREVIEW_MAX_HEIGHT)
+        .show(ui, |ui| {
+            egui::Grid::new("peak-export")
+                .num_columns(EXPORT_COLUMNS.len())
+                .spacing([spacing::MD, spacing::XS])
+                .show(ui, |ui| {
+                    table_header_row(ui, t, &EXPORT_COLUMNS);
+                    for peak in &view.peaks {
+                        for (cell, width) in export_row(peak).iter().zip(EXPORT_WIDTHS) {
+                            if width > 0.0 {
+                                num_cell(ui, t, width, cell);
+                            } else {
+                                ui.label(
+                                    egui::RichText::new(cell)
+                                        .font(font_code())
+                                        .color(c(t.text_primary)),
+                                );
+                            }
+                        }
+                        ui.end_row();
+                    }
+                });
+        });
 }
 
 /// Right-rail detail card for the selected peak, plus its shape mini-view.
@@ -801,21 +918,18 @@ pub fn results_table(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) {
         .num_columns(6)
         .spacing([spacing::LG, spacing::XS])
         .show(ui, |ui| {
-            for header in [
-                "Peak",
-                "Channel",
-                "Ve (mL)",
-                "Area",
-                "Est. MW (kDa)",
-                "Conc. (mg/mL)",
-            ] {
-                ui.label(
-                    egui::RichText::new(header)
-                        .font(font_micro())
-                        .color(c(t.text_secondary)),
-                );
-            }
-            ui.end_row();
+            table_header_row(
+                ui,
+                t,
+                &[
+                    "Peak",
+                    "Channel",
+                    "Ve (mL)",
+                    "Area",
+                    "Est. MW (kDa)",
+                    "Conc. (mg/mL)",
+                ],
+            );
 
             for peak in &view.peaks {
                 ui.label(egui::RichText::new(peak.id.to_string()).font(font_code()));
@@ -883,4 +997,69 @@ fn estimated_mw_for_peak(
         return None;
     }
     calibration.and_then(|cal| cal.mw_for_volume(peak.apex_volume_ml))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use elusive_core::model::{BaselineMode, ChannelId, PeakId};
+    use elusive_core::sidecar;
+
+    fn sample_peak() -> PeakResult {
+        PeakResult {
+            id: PeakId(1),
+            channel_id: ChannelId::from("MWave2"),
+            v_start_ml: 12.0,
+            v_end_ml: 14.0,
+            baseline: BaselineMode::LinearEndpoints,
+            area: 1234.5,
+            height: 890.0,
+            apex_volume_ml: 13.0,
+            fwhm_ml: Some(0.8),
+            estimated_mw_kda: None,
+        }
+    }
+
+    #[test]
+    fn every_export_column_has_a_cell_and_a_width() {
+        assert_eq!(EXPORT_COLUMNS.len(), EXPORT_WIDTHS.len());
+        assert_eq!(export_row(&sample_peak()).len(), EXPORT_COLUMNS.len());
+    }
+
+    #[test]
+    fn the_preview_shows_the_same_columns_the_csv_writes() {
+        // The point of the preview is that it previews. If the export schema
+        // gains a column, this fails rather than quietly showing a stale table.
+        let header = sidecar::peaks_to_csv(&[]);
+        assert_eq!(
+            header.trim_end().split(',').count(),
+            EXPORT_COLUMNS.len(),
+            "csv header = {header:?}"
+        );
+    }
+
+    #[test]
+    fn preview_cells_match_the_markdown_export_value_for_value() {
+        let peak = sample_peak();
+        let cells = export_row(&peak);
+        let md = sidecar::peaks_to_markdown(std::slice::from_ref(&peak));
+        let row: Vec<&str> = md
+            .lines()
+            .nth(2)
+            .expect("one peak produces one body row")
+            .trim_matches('|')
+            .split('|')
+            .map(str::trim)
+            .collect();
+        assert_eq!(row, cells.iter().map(String::as_str).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn an_unmeasured_value_shows_a_dash_not_a_zero() {
+        let mut peak = sample_peak();
+        peak.fwhm_ml = None;
+        let cells = export_row(&peak);
+        assert_eq!(cells[7], "—");
+        assert_eq!(cells[8], "—");
+    }
 }

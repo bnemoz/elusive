@@ -243,6 +243,44 @@ pub fn peaks_to_csv(peaks: &[PeakResult]) -> String {
     out
 }
 
+/// Shown for a value the run does not carry. An empty Markdown cell reads as an
+/// oversight; an em dash reads as "not measured".
+const EM_DASH: &str = "—";
+
+/// The peak table as a GitHub-flavoured Markdown table.
+///
+/// Same columns and same numeric precision as [`peaks_to_csv`]: this is the CSV
+/// rendered for a human reader — an electronic notebook entry or an issue comment
+/// — so the two must never disagree about a value. The one deliberate difference
+/// is the peak column, which carries the `P1` label the plot annotates rather than
+/// the bare integer a script would parse. Numeric columns get the `---:` alignment
+/// marker, which is how Markdown expresses rule #4.
+pub fn peaks_to_markdown(peaks: &[PeakResult]) -> String {
+    let mut out = String::from(
+        "| Peak | Channel | Start (mL) | End (mL) | Ve (mL) | Area | Height | FWHM (mL) | \
+         Est. MW (kDa) |\n| ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+    );
+    for p in peaks {
+        out.push_str(&format!(
+            "| {} | {} | {:.4} | {:.4} | {:.4} | {:.6} | {:.6} | {} | {} |\n",
+            p.id,
+            md_escape(p.channel_id.as_str()),
+            p.v_start_ml,
+            p.v_end_ml,
+            p.apex_volume_ml,
+            p.area,
+            p.height,
+            p.fwhm_ml
+                .map(|v| format!("{v:.4}"))
+                .unwrap_or_else(|| EM_DASH.to_string()),
+            p.estimated_mw_kda
+                .map(|v| format!("{v:.3}"))
+                .unwrap_or_else(|| EM_DASH.to_string()),
+        ));
+    }
+    out
+}
+
 /// One row per collected well.
 /// Schema fixed by `IMPLEMENTATION_PLAN.md` Phase 5.
 pub fn wells_to_csv(rows: &[(crate::model::Well, String, PlateMetric, Option<f64>)]) -> String {
@@ -259,6 +297,16 @@ pub fn wells_to_csv(rows: &[(crate::model::Well, String, PlateMetric, Option<f64
         ));
     }
     out
+}
+
+/// Keep a channel name inside its Markdown cell.
+///
+/// A bare `|` would split the row into extra columns and silently shift every
+/// value one cell to the right; newlines would end the row outright.
+fn md_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('|', "\\|")
+        .replace(['\n', '\r'], " ")
 }
 
 fn csv_escape(s: &str) -> String {
@@ -464,6 +512,52 @@ mod tests {
             None,
         )]);
         assert!(csv.lines().nth(1).unwrap().ends_with(','));
+    }
+
+    #[test]
+    fn peak_markdown_has_a_header_an_alignment_row_and_one_row_per_peak() {
+        let md = peaks_to_markdown(&[sample_peak()]);
+        let lines: Vec<&str> = md.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(
+            lines[0],
+            "| Peak | Channel | Start (mL) | End (mL) | Ve (mL) | Area | Height | FWHM (mL) | \
+             Est. MW (kDa) |"
+        );
+        // Numeric columns are right-aligned; only the channel name is not.
+        assert_eq!(
+            lines[1],
+            "| ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+        );
+        assert_eq!(
+            lines[2],
+            "| P1 | MWave2 | 12.0000 | 14.0000 | 13.0000 | 1234.500000 | 890.000000 | 0.8000 | — |"
+        );
+        // Every row has the same cell count, or a Markdown renderer drops cells.
+        for line in &lines {
+            assert_eq!(line.matches('|').count(), 10, "line = {line}");
+        }
+    }
+
+    #[test]
+    fn peak_markdown_with_no_peaks_is_still_a_valid_table() {
+        let md = peaks_to_markdown(&[]);
+        assert_eq!(md.lines().count(), 2);
+        assert!(md.ends_with("|\n"));
+    }
+
+    #[test]
+    fn a_pipe_in_a_channel_name_cannot_forge_a_column() {
+        let mut p = sample_peak();
+        p.channel_id = ChannelId::from("UV|280");
+        let md = peaks_to_markdown(&[p]);
+        let row = md.lines().nth(2).unwrap();
+        assert!(row.contains("UV\\|280"), "row = {row}");
+        // The escaped pipe still counts as a `|` character, so compare against the
+        // header instead of a bare count.
+        let header_cells = md.lines().next().unwrap().matches('|').count();
+        assert_eq!(row.matches("\\|").count(), 1);
+        assert_eq!(row.matches('|').count() - 1, header_cells);
     }
 
     #[test]
