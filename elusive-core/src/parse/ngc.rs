@@ -4,8 +4,9 @@
 //!
 //! ```text
 //! Version.txt                              (methodruns only)
-//! Method/MethodData.xml, MethodInfo.xml
-//! Runs/Run1.xml, RunInfo1.xml
+//! Methods/MethodData1.xml, MethodInfo1.xml (also seen as Method/ without the 1)
+//! Runs/Run1.xml, Runs/RunInfo1.xml
+//! Runs/AnalysisRunViewSettings1.xml
 //! Runs/Run1/Trace_<Name>_<idx>.xml
 //! Analysis.xml                             (analysis export only)
 //! ```
@@ -23,6 +24,15 @@ use base64::Engine as _;
 use std::collections::BTreeMap;
 use std::io::{Read, Seek};
 use std::path::Path;
+
+/// Stored-unit peak above which a UV trace cannot really be in AU.
+///
+/// Purely a sanity threshold on the *output*, never an input to the scale
+/// decision. 20 AU is 20 000 mAU once the NGC convention is applied, and a prep
+/// UV detector saturates one to two orders of magnitude below that — so a trace
+/// exceeding it is far more likely to be stored in mAU already than to be a
+/// genuine 20 AU signal.
+const IMPLAUSIBLE_AU_PEAK: f32 = 20.0;
 
 /// Fallback UV wavelengths for `MWave0..3` when the method XML does not name them.
 /// Using these unconditionally would be a silent lie, so a warning always
@@ -90,7 +100,7 @@ pub fn from_reader<R: Read + Seek>(reader: R, path: &Path, format: SourceFormat)
         }
     }
 
-    fill_meta(&mut meta, &run_leaves, &method_leaves);
+    fill_meta(&mut meta, &run_leaves, &method_leaves, &mut warnings);
     if meta.run_name.is_empty() {
         meta.run_name = path
             .file_stem()
@@ -209,7 +219,18 @@ fn normalise(entry: &str) -> String {
 
 fn is_method_entry(entry: &str) -> bool {
     let e = normalise(entry);
-    e.starts_with("method/") && e.ends_with(".xml")
+    if !e.ends_with(".xml") {
+        return false;
+    }
+    // Both spellings, because the real archive disagreed with the spec. A
+    // Superdex SEC export from ChromLab puts the method in `Methods/` (plural,
+    // and the files are numbered: `Methods/MethodData1.xml`), while `design.md`
+    // §3 documented `Method/`. Matching only the singular meant the method XML
+    // was never read at all, which is why the wavelength mapping silently fell
+    // back to positional order and `ColumnType` never reached `RunMeta` — one
+    // missing letter, two wrong answers downstream.
+    let (dir, _) = e.split_once('/').unwrap_or(("", ""));
+    dir == "method" || dir == "methods"
 }
 
 fn is_run_info_entry(entry: &str) -> bool {
@@ -396,14 +417,35 @@ fn pretty_trace_name(raw: &str) -> String {
     out
 }
 
-/// Storage-vs-display scale policy (`design.md` §15, open question 2).
+/// Storage-vs-display scale policy (`design.md` §15, resolved 2026-08-02).
 ///
-/// Raw values are always stored untouched. UV is the only channel where ChromLab's
-/// displayed unit differs from the stored one: the archive holds AU, the software
-/// shows mAU. When the entry declares its unit we honour it. When it does not we
-/// fall back to a magnitude test — prep-scale UV in AU peaks below ~20, in mAU it
-/// runs into the hundreds — and always warn, because a wrong guess here is a
-/// factor of 1000 on every reported area.
+/// Raw values are always stored untouched. UV is the only channel whose displayed
+/// unit differs from its stored one: **an NGC archive holds AU and ChromLab shows
+/// mAU**. That is now a verified property of the format rather than an inference,
+/// so it is applied as a convention.
+///
+/// The evidence, from `docs/format-findings.md`: a real export's `MWave0` payload
+/// peaks at 0.22661, and ChromLab's own `<Height>` for that same peak — stored in
+/// `Analysis.xml`, computed by the vendor's software — is 0.227303. Same units,
+/// and 227 mAU is a real prep-SEC peak where 0.227 mAU would be indistinguishable
+/// from noise.
+///
+/// What this replaces matters. Previously an undeclared unit fell through to a
+/// magnitude test ("a peak under ~20 suggests AU"), which *chose the scale from
+/// the data*. An NGC trace header declares `Version`, `OriginalRunDataId`,
+/// `TraceVersion`, `DeviceUID`, `TraceType` and `TraceData` — and **no unit at
+/// all** — so that branch ran on every single UV trace. It gave the right answer
+/// here, but a genuinely dilute run peaking under 20 mAU and a saturated one
+/// would have been scaled differently from each other, and nothing on screen
+/// would have said so.
+///
+/// A declared unit still wins, in case a future ChromLab starts emitting one.
+///
+/// The magnitude test survives only as a **plausibility guard**: it no longer
+/// selects the scale, it just flags a result that cannot be right. Applying the
+/// convention to a trace already in mAU would show ~227000 mAU, which is
+/// obviously broken rather than quietly plausible — and loudly wrong is the
+/// failure mode to prefer.
 fn display_scale_for(
     entry: &str,
     kind: ChannelKind,
@@ -427,6 +469,8 @@ fn display_scale_for(
         return (1000.0, "mAU".to_string(), None);
     }
 
+    // No declared unit: apply the NGC convention. Unconditionally, so the scale
+    // is a property of the format and not of how concentrated the sample was.
     let peak = channel
         .samples
         .iter()
@@ -434,31 +478,20 @@ fn display_scale_for(
         .map(|s| s.value.abs())
         .fold(0.0f32, f32::max);
 
-    if peak > 20.0 {
-        (
-            1.0,
-            "mAU".to_string(),
-            Some(Warning::new(
-                entry,
-                format!(
-                    "UV unit not declared; peak value {peak:.1} suggests the trace is already \
-                     in mAU, so no scaling was applied"
-                ),
-            )),
+    let warning = (peak > IMPLAUSIBLE_AU_PEAK).then(|| {
+        Warning::new(
+            entry,
+            format!(
+                "this UV trace peaks at {peak:.1} in stored units. An NGC archive stores AU, \
+                 so it is displayed as {:.0} mAU — but a real detector does not reach that, \
+                 which suggests this trace is already in mAU. Treat its absorbance, peak areas \
+                 and any concentration from it as unreliable until the source is checked.",
+                peak * 1000.0
+            ),
         )
-    } else {
-        (
-            1000.0,
-            "mAU".to_string(),
-            Some(Warning::new(
-                entry,
-                format!(
-                    "UV unit not declared; peak value {peak:.4} suggests AU, so values are \
-                     displayed as mAU (x1000)"
-                ),
-            )),
-        )
-    }
+    });
+
+    (1000.0, "mAU".to_string(), warning)
 }
 
 fn default_unit_for(kind: ChannelKind) -> &'static str {
@@ -621,7 +654,61 @@ fn wavelength_in_text(text: &str) -> Option<u16> {
 
 // --- Metadata ---------------------------------------------------------------
 
-fn fill_meta(meta: &mut RunMeta, run_leaves: &[Leaf], method_leaves: &[Leaf]) {
+/// A column volume, but only when the method says one thing.
+///
+/// `ColumnVolume` is not unique in a ChromLab method: the observed archive holds
+/// both `23.5619449019234` — the true bed volume of a 10 mm x 30 cm column, and
+/// exactly pi*0.5^2*30 — and a bare `1` under the same element name somewhere
+/// else in the document. `first_text_any` would resolve that by document order,
+/// which is a coin flip, and a Vt of 1 mL instead of 23.6 mL would distort every
+/// Kav-based molecular weight without looking obviously wrong.
+///
+/// So when the candidates disagree this reports the ambiguity and yields
+/// nothing. `design.md` is explicit that a plausible wrong number is worse than
+/// an admitted unknown, and the Calibration tab already accepts the value by
+/// hand — losing an automatic fill is a far smaller cost than a silent 23x error.
+fn unambiguous_volume(
+    leaves: &[Leaf],
+    names: &[&str],
+    label: &str,
+    warnings: &mut Vec<Warning>,
+) -> Option<f32> {
+    let mut candidates: Vec<f32> = xml::all_texts_any(leaves, names)
+        .iter()
+        .filter_map(|t| xml::parse_f32(t))
+        .filter(|v| *v > 0.0)
+        .collect();
+    candidates.sort_by(|a, b| a.total_cmp(b));
+    candidates.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+
+    match candidates.len() {
+        0 => None,
+        1 => Some(candidates[0]),
+        _ => {
+            warnings.push(Warning::new(
+                "calibration",
+                format!(
+                    "the method declares {} different {label} values ({}); none was adopted \
+                     because picking one would be a guess. Enter {label} by hand in Calibration.",
+                    candidates.len(),
+                    candidates
+                        .iter()
+                        .map(|v| format!("{v} mL"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ));
+            None
+        }
+    }
+}
+
+fn fill_meta(
+    meta: &mut RunMeta,
+    run_leaves: &[Leaf],
+    method_leaves: &[Leaf],
+    warnings: &mut Vec<Warning>,
+) {
     let pick = |leaves: &[Leaf], names: &[&str]| xml::first_text_any(leaves, names);
 
     meta.run_name = pick(run_leaves, &["RunName", "Name", "Title"]).unwrap_or_default();
@@ -639,34 +726,40 @@ fn fill_meta(meta: &mut RunMeta, run_leaves: &[Leaf], method_leaves: &[Leaf]) {
     meta.column = pick(method_leaves, &["Column", "ColumnName", "ColumnType"])
         .or_else(|| pick(run_leaves, &["Column", "ColumnName"]));
 
-    meta.v0_ml = pick(
+    meta.v0_ml = unambiguous_volume(
         method_leaves,
         &["VoidVolume", "V0", "ColumnVoidVolume", "VoidVolumeMl"],
-    )
-    .as_deref()
-    .and_then(xml::parse_f32)
-    .filter(|v| *v > 0.0);
+        "V0",
+        warnings,
+    );
 
-    meta.vt_ml = pick(
+    meta.vt_ml = unambiguous_volume(
         method_leaves,
         &["ColumnVolume", "Vt", "TotalVolume", "BedVolume"],
-    )
-    .as_deref()
-    .and_then(xml::parse_f32)
-    .filter(|v| *v > 0.0);
+        "Vt",
+        warnings,
+    );
 
-    meta.path_length_cm = pick(
-        method_leaves,
-        &[
-            "PathLength",
-            "PathLengthCm",
-            "CellPathLength",
-            "FlowCellPathLength",
-        ],
-    )
-    .as_deref()
-    .and_then(xml::parse_f32)
-    .filter(|v| *v > 0.0);
+    // Path length is the one flow-cell property the archive actually carries,
+    // and it is not in the method: ChromLab stamps it onto every peak record in
+    // `Analysis.xml`, which `is_run_info_entry` folds into `run_leaves`. The
+    // method is still searched first in case another ChromLab version records it
+    // there, but the run-side fallback is what finds it in practice.
+    //
+    // Getting this wrong is not cosmetic. With no value the UI falls back to a
+    // 0.2 cm default, and a real NGC flow cell is 0.5 cm — a 2.5x error landing
+    // directly in the Beer-Lambert concentration.
+    const PATH_LENGTH_NAMES: &[&str] = &[
+        "PathLength",
+        "PathLengthCm",
+        "CellPathLength",
+        "FlowCellPathLength",
+    ];
+    meta.path_length_cm = pick(method_leaves, PATH_LENGTH_NAMES)
+        .or_else(|| pick(run_leaves, PATH_LENGTH_NAMES))
+        .as_deref()
+        .and_then(xml::parse_f32)
+        .filter(|v| *v > 0.0);
 }
 
 // --- Fractions --------------------------------------------------------------
@@ -687,7 +780,17 @@ fn parse_fraction_payload(entry: &str, blob: &[u8]) -> Result<Vec<Fraction>> {
 
     let records = xml::records(entry, &text, "CFCData")?;
     if records.is_empty() {
-        return Err(Error::fractions(entry, "no <CFCData> records found"));
+        // An empty companion is normal, not broken. A real archive carries two
+        // `Trace_Fractions_*` entries and only one is populated — the observed
+        // pair was 350 KB of records against a bare
+        // `<RootNodeOfCFCData><Node /></RootNodeOfCFCData>`. Treating that as a
+        // malformed record put a red herring in the Review-required panel on
+        // every single run, which is corrosive: a panel that always cries wolf
+        // stops being read, and it is the one place real assumptions surface.
+        //
+        // Returning an empty source is safe because `reconcile_fraction_sources`
+        // already drops empty candidates, and warns if *every* source was empty.
+        return Ok(Vec::new());
     }
 
     // A tube may appear twice, once as FractionStart and once as FractionDone;
@@ -797,8 +900,22 @@ fn reconcile_fraction_sources(
     mut sources: Vec<(String, Vec<Fraction>)>,
     warnings: &mut Vec<Warning>,
 ) -> Vec<Fraction> {
+    let offered = sources.len();
     sources.retain(|(_, f)| !f.is_empty());
     if sources.is_empty() {
+        // One empty fraction trace beside a populated one is routine and stays
+        // silent. Every source being empty is different: the run either
+        // collected nothing or we failed to read what it collected, and the
+        // plate will be blank either way, so the user is owed an explanation.
+        if offered > 0 {
+            warnings.push(Warning::new(
+                "fractions",
+                format!(
+                    "{offered} fraction trace(s) were present but none held any records; \
+                     the plate view will be empty"
+                ),
+            ));
+        }
         return Vec::new();
     }
     if sources.len() == 1 {
@@ -993,7 +1110,117 @@ mod tests {
         assert!(is_run_info_entry("Runs/Run1.xml"));
         assert!(is_run_info_entry("Runs/RunInfo1.xml"));
         assert!(is_method_entry("Method/MethodData.xml"));
+        // The plural spelling is what a real ChromLab export actually uses.
+        // Missing it meant the method XML was never read, which silently cost us
+        // the wavelength mapping and the column identity.
+        assert!(is_method_entry("Methods/MethodData1.xml"));
+        assert!(is_method_entry("Methods/MethodInfo1.xml"));
         assert!(!is_method_entry("Runs/Run1.xml"));
+        // Guard the boundary: only a leading path segment counts, so an entry
+        // that merely begins with those letters is not a method file.
+        assert!(!is_method_entry("MethodologyNotes/readme.xml"));
+        assert!(!is_method_entry("Runs/Method/Trace_x.xml"));
+    }
+
+    #[test]
+    fn a_single_declared_column_volume_is_adopted() {
+        let leaves = vec![Leaf {
+            name: "ColumnVolume".into(),
+            text: "23.5619449019234".into(),
+            attrs: Vec::new(),
+        }];
+        let mut warnings = Vec::new();
+        let v = unambiguous_volume(&leaves, &["ColumnVolume"], "Vt", &mut warnings);
+        assert_eq!(v, Some(23.561_945));
+        assert!(warnings.is_empty(), "one clear value needs no warning");
+    }
+
+    #[test]
+    fn conflicting_column_volumes_are_refused_and_reported() {
+        // The real archive declares <ColumnVolume> as both `1` and
+        // `23.5619449019234`. Document order decided which one won, and adopting
+        // `1` as Vt would have skewed every Kav molecular weight by ~23x while
+        // still looking like a plausible number.
+        let leaves = vec![
+            Leaf {
+                name: "ColumnVolume".into(),
+                text: "1".into(),
+                attrs: Vec::new(),
+            },
+            Leaf {
+                name: "ColumnVolume".into(),
+                text: "23.5619449019234".into(),
+                attrs: Vec::new(),
+            },
+        ];
+        let mut warnings = Vec::new();
+        let v = unambiguous_volume(&leaves, &["ColumnVolume"], "Vt", &mut warnings);
+        assert_eq!(v, None, "ambiguity must not resolve to a guess");
+        assert_eq!(warnings.len(), 1);
+        let m = &warnings[0].message;
+        assert!(m.contains("1 mL") && m.contains("23.561945"), "{m}");
+        assert!(m.contains("Calibration"), "must say how to proceed: {m}");
+    }
+
+    #[test]
+    fn repeated_but_identical_volumes_are_not_an_ambiguity() {
+        // ChromLab repeats the same value in more than one place. Agreement is
+        // not a conflict, so this must not trip the refusal path.
+        let leaves = vec![
+            Leaf {
+                name: "ColumnVolume".into(),
+                text: "23.5619449019234".into(),
+                attrs: Vec::new(),
+            },
+            Leaf {
+                name: "ColumnVolumePrev".into(),
+                text: "23.5619449019234".into(),
+                attrs: Vec::new(),
+            },
+        ];
+        let mut warnings = Vec::new();
+        let v = unambiguous_volume(
+            &leaves,
+            &["ColumnVolume", "ColumnVolumePrev"],
+            "Vt",
+            &mut warnings,
+        );
+        assert_eq!(v, Some(23.561_945));
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn an_empty_fraction_payload_yields_no_records_rather_than_an_error() {
+        // A real archive carries two Trace_Fractions_* entries with only one
+        // populated; the other is a bare <Node />. Calling that malformed put a
+        // permanent false alarm in the Review-required panel.
+        let xml = concat!(
+            r#"<?xml version="1.0"?>"#,
+            "<RootNodeOfCFCData><Node /></RootNodeOfCFCData>"
+        );
+        let encoded = base64::engine::general_purpose::STANDARD.encode(xml);
+        let blob = decode_base64("Trace_Fractions_19.xml", &encoded).expect("decodes");
+        let out = parse_fraction_payload("Trace_Fractions_19.xml", &blob)
+            .expect("an empty companion is benign, not an error");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn every_fraction_source_being_empty_is_still_reported() {
+        // The benign case above must not swallow the real failure: if nothing
+        // anywhere held records the plate will be blank, and silence would leave
+        // the user with no explanation.
+        let mut warnings = Vec::new();
+        let out = reconcile_fraction_sources(
+            vec![
+                ("Trace_Fractions_1.xml".to_string(), Vec::new()),
+                ("Trace_Fractions_19.xml".to_string(), Vec::new()),
+            ],
+            &mut warnings,
+        );
+        assert!(out.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].message.contains("none held any records"));
     }
 
     #[test]
@@ -1094,18 +1321,70 @@ mod tests {
     }
 
     #[test]
-    fn undeclared_uv_unit_is_guessed_from_magnitude_and_always_warns() {
+    fn an_undeclared_uv_unit_follows_the_ngc_au_convention_without_warning() {
+        // NGC trace headers carry no unit, so this is the path every real UV
+        // trace takes. AU storage is a verified property of the format, not an
+        // inference, so it applies silently — the Review-required panel is for
+        // assumptions, and this is no longer one.
         let mut small = Channel::new("MWave2", "UV", ChannelKind::Uv);
         small.samples = vec![Sample::new(0.0, 0.0, 1.2)];
-        let (scale, _, warn) = display_scale_for("e", ChannelKind::Uv, "", &small);
+        let (scale, unit, warn) = display_scale_for("e", ChannelKind::Uv, "", &small);
         assert_eq!(scale, 1000.0);
-        assert!(warn.is_some(), "an assumed scale must be surfaced");
+        assert_eq!(unit, "mAU");
+        assert!(warn.is_none(), "a verified convention is not an assumption");
+    }
 
-        let mut large = Channel::new("MWave2", "UV", ChannelKind::Uv);
-        large.samples = vec![Sample::new(0.0, 0.0, 850.0)];
-        let (scale, _, warn) = display_scale_for("e", ChannelKind::Uv, "", &large);
-        assert_eq!(scale, 1.0);
-        assert!(warn.is_some());
+    #[test]
+    fn the_au_convention_does_not_bend_to_a_dilute_or_concentrated_run() {
+        // The point of replacing the magnitude test. Two runs three orders of
+        // magnitude apart must get the same scale, because the scale is a
+        // property of the file format and not of the sample.
+        let mut faint = Channel::new("MWave2", "UV", ChannelKind::Uv);
+        faint.samples = vec![Sample::new(0.0, 0.0, 0.0004)];
+        let mut strong = Channel::new("MWave2", "UV", ChannelKind::Uv);
+        strong.samples = vec![Sample::new(0.0, 0.0, 2.5)];
+
+        let (faint_scale, _, _) = display_scale_for("e", ChannelKind::Uv, "", &faint);
+        let (strong_scale, _, _) = display_scale_for("e", ChannelKind::Uv, "", &strong);
+        assert_eq!(faint_scale, strong_scale);
+        assert_eq!(faint_scale, 1000.0);
+    }
+
+    #[test]
+    fn an_impossible_uv_peak_is_flagged_but_still_scaled_deterministically() {
+        // A trace already in mAU would show ~850000 mAU. The old code silently
+        // switched to 1.0 and produced a plausible-looking 850 — quietly wrong.
+        // Now the convention still applies, so the number on screen is visibly
+        // absurd, and the warning says why. Loudly wrong beats quietly wrong.
+        let mut already_mau = Channel::new("MWave2", "UV", ChannelKind::Uv);
+        already_mau.samples = vec![Sample::new(0.0, 0.0, 850.0)];
+        let (scale, _, warn) = display_scale_for("e", ChannelKind::Uv, "", &already_mau);
+        assert_eq!(
+            scale, 1000.0,
+            "the guard advises; it must not change the value"
+        );
+        let w = warn.expect("an impossible peak must be reported");
+        assert!(w.message.contains("already in mAU"), "{}", w.message);
+        assert!(
+            w.message.contains("unreliable"),
+            "say what it means for the numbers: {}",
+            w.message
+        );
+    }
+
+    #[test]
+    fn a_declared_unit_still_overrides_the_convention() {
+        // Defensive: no NGC archive seen so far declares one, but if a future
+        // ChromLab starts emitting units they must win over a convention
+        // inferred from archives that did not.
+        let mut uv = Channel::new("MWave2", "UV", ChannelKind::Uv);
+        uv.samples = vec![Sample::new(0.0, 0.0, 850.0)];
+        let (scale, _, warn) = display_scale_for("e", ChannelKind::Uv, "mAU", &uv);
+        assert_eq!(scale, 1.0, "a declared mAU is not rescaled");
+        assert!(
+            warn.is_none(),
+            "the peak only looks implausible under the convention, which was not applied"
+        );
     }
 
     #[test]

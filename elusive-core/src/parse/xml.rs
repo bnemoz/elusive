@@ -135,6 +135,22 @@ pub fn first_text_any(leaves: &[Leaf], names: &[&str]) -> Option<String> {
     names.iter().find_map(|n| first_text(leaves, n))
 }
 
+/// Every non-empty text under any element whose local name matches `names`.
+///
+/// Distinct from [`first_text_any`], which stops at the first hit. Some ChromLab
+/// method fields are not unique — `ColumnVolume` appears both as a real bed
+/// volume and, elsewhere in the same document, as an unrelated small integer.
+/// Taking the first match there is a coin flip, so a caller that cannot tolerate
+/// picking wrong needs to see all the candidates and decide.
+pub fn all_texts_any(leaves: &[Leaf], names: &[&str]) -> Vec<String> {
+    leaves
+        .iter()
+        .filter(|l| names.iter().any(|n| l.name.eq_ignore_ascii_case(n)))
+        .map(|l| l.text.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
 /// Records grouped under repeated occurrences of `record_name`.
 ///
 /// Each record maps child local name → text. Attributes on the record element
