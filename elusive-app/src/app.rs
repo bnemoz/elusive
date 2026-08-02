@@ -120,6 +120,10 @@ impl EluSiveApp {
         let picked = rfd::FileDialog::new()
             .add_filter("NGC run", &["ngcAnalysis", "ngcMethodruns"])
             .add_filter("ChromLab CSV export", &["csv"])
+            // ÄKTA is listed last: it currently opens as a container inventory
+            // rather than a readable run, so it should not look like a peer of
+            // the two formats that actually plot.
+            .add_filter("ÄKTA UNICORN 6/7 result", &["res", "zip"])
             .add_filter("All files", &["*"])
             .pick_file();
         if let Some(path) = picked {
