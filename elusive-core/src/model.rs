@@ -42,6 +42,18 @@ impl Sample {
     }
 }
 
+/// Endpoint equality that survives a unit conversion.
+///
+/// The plain `f32::EPSILON` test used by [`Channel::value_at_volume`] is an
+/// *absolute* 1.2e-7, which is far below one ulp of a run time in seconds (a
+/// 4551 s run has an ulp near 5e-4). A caller that asks for the last sample after
+/// a seconds↔minutes round trip would therefore be told it is out of range. The
+/// tolerance is scaled to the magnitude of the operands so the endpoints of the
+/// time↔volume conversions stay reachable.
+fn nearly_equal(a: f32, b: f32) -> bool {
+    (a - b).abs() <= 4.0 * f32::EPSILON * a.abs().max(b.abs()).max(1.0)
+}
+
 /// Drives default axis grouping, units, and colour assignment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ChannelKind {
@@ -309,6 +321,69 @@ impl Channel {
         }
         let t = (volume_ml - a.volume_ml) / span;
         Some(a.value + t * (b.value - a.value))
+    }
+
+    /// Elapsed time in **minutes** at a given elution volume.
+    ///
+    /// Interpolates the recorded sample pairs. Flow rate is not constant across a
+    /// method — gradients, wash steps and pauses all change it — so scaling a
+    /// volume by an average rate would misplace anything drawn on a time axis.
+    ///
+    /// Like [`Channel::value_at_volume`], returns `None` outside the sampled range
+    /// rather than clamping, so a caller can tell "no data here" from "flat here".
+    pub fn time_min_at_volume(&self, volume_ml: f32) -> Option<f32> {
+        let s = &self.samples;
+        if s.is_empty() || !volume_ml.is_finite() {
+            return None;
+        }
+        // Monotonic in volume (the instrument pumps forwards), so binary search
+        // is valid — same assumption `value_at_volume` relies on.
+        let idx = s.partition_point(|p| p.volume_ml < volume_ml);
+        if idx == 0 {
+            let first = s[0];
+            return nearly_equal(first.volume_ml, volume_ml).then_some(first.time_s / 60.0);
+        }
+        if idx >= s.len() {
+            let last = s[s.len() - 1];
+            return nearly_equal(last.volume_ml, volume_ml).then_some(last.time_s / 60.0);
+        }
+        let (a, b) = (s[idx - 1], s[idx]);
+        let span = b.volume_ml - a.volume_ml;
+        if span.abs() < f32::EPSILON {
+            return Some(a.time_s / 60.0);
+        }
+        let t = (volume_ml - a.volume_ml) / span;
+        Some((a.time_s + t * (b.time_s - a.time_s)) / 60.0)
+    }
+
+    /// Elution volume in mL at a given elapsed time in **minutes**.
+    ///
+    /// The inverse of [`Channel::time_min_at_volume`], and interpolating for the
+    /// same reason: the two are only linearly related while the flow rate holds.
+    pub fn volume_ml_at_time_min(&self, time_min: f32) -> Option<f32> {
+        let s = &self.samples;
+        if s.is_empty() || !time_min.is_finite() {
+            return None;
+        }
+        let time_s = time_min * 60.0;
+        // Monotonic in time for the same reason it is monotonic in volume: the
+        // record is a forward-running acquisition.
+        let idx = s.partition_point(|p| p.time_s < time_s);
+        if idx == 0 {
+            let first = s[0];
+            return nearly_equal(first.time_s, time_s).then_some(first.volume_ml);
+        }
+        if idx >= s.len() {
+            let last = s[s.len() - 1];
+            return nearly_equal(last.time_s, time_s).then_some(last.volume_ml);
+        }
+        let (a, b) = (s[idx - 1], s[idx]);
+        let span = b.time_s - a.time_s;
+        if span.abs() < f32::EPSILON {
+            return Some(a.volume_ml);
+        }
+        let t = (time_s - a.time_s) / span;
+        Some(a.volume_ml + t * (b.volume_ml - a.volume_ml))
     }
 
     /// Samples whose volume lies inside `[v0, v1]`, inclusive.
@@ -775,5 +850,95 @@ mod tests {
         // The two `Trace_Fractions_*` streams can both describe the same tube.
         let run = run_with(vec![fraction(3, 12.0, 1.0), fraction(3, 12.0, 1.0)]);
         assert_eq!(labels(&run, 12.0, 13.0), ["A3"]);
+    }
+
+    // --- volume ↔ time conversion ----------------------------------------
+
+    /// A run whose flow rate halves half way through: 1 mL/min for the first two
+    /// minutes, then 0.5 mL/min. Anything assuming a constant rate would place the
+    /// last point at 4 mL rather than 3 mL.
+    fn variable_flow() -> Channel {
+        let mut ch = Channel::new("MWave2", "UV 280 nm", ChannelKind::Uv);
+        ch.samples = vec![
+            Sample::new(0.0, 0.0, 0.0),
+            Sample::new(60.0, 1.0, 1.0),
+            Sample::new(120.0, 2.0, 2.0),
+            Sample::new(240.0, 3.0, 3.0),
+        ];
+        ch
+    }
+
+    #[test]
+    fn time_at_volume_interpolates_the_actual_sample_pairs() {
+        let ch = variable_flow();
+        assert_eq!(ch.time_min_at_volume(0.5), Some(0.5));
+        // In the slow segment 0.5 mL costs a full minute, not half of one.
+        let t = ch
+            .time_min_at_volume(2.5)
+            .expect("inside the sampled range");
+        assert!((t - 3.0).abs() < 1e-5, "t = {t}");
+    }
+
+    #[test]
+    fn volume_at_time_interpolates_the_actual_sample_pairs() {
+        let ch = variable_flow();
+        assert_eq!(ch.volume_ml_at_time_min(1.5), Some(1.5));
+        let v = ch
+            .volume_ml_at_time_min(3.0)
+            .expect("inside the sampled range");
+        assert!((v - 2.5).abs() < 1e-5, "v = {v}");
+    }
+
+    #[test]
+    fn the_conversions_round_trip_including_at_the_endpoints() {
+        let ch = variable_flow();
+        for v in [0.0f32, 0.25, 1.0, 2.75, 3.0] {
+            let t = ch.time_min_at_volume(v).expect("inside the sampled range");
+            let back = ch
+                .volume_ml_at_time_min(t)
+                .expect("a time derived from a sampled volume is in range");
+            assert!((back - v).abs() < 1e-4, "v = {v}, back = {back}");
+        }
+    }
+
+    #[test]
+    fn a_long_run_still_resolves_its_last_sample_after_a_unit_conversion() {
+        // Regression guard for the endpoint tolerance: 4551 s is a realistic run
+        // length and its f32 ulp is far larger than `f32::EPSILON`, so an absolute
+        // epsilon test would report the final sample as out of range.
+        let mut ch = Channel::new("MWave2", "UV 280 nm", ChannelKind::Uv);
+        ch.samples = vec![Sample::new(0.0, 0.0, 0.0), Sample::new(4551.0, 37.9, 1.0)];
+        let t = ch
+            .time_min_at_volume(37.9)
+            .expect("the last sample is in range");
+        assert!(ch.volume_ml_at_time_min(t).is_some());
+    }
+
+    #[test]
+    fn out_of_range_lookups_report_no_data_rather_than_clamping() {
+        let ch = variable_flow();
+        assert_eq!(ch.time_min_at_volume(-0.1), None);
+        assert_eq!(ch.time_min_at_volume(3.1), None);
+        assert_eq!(ch.time_min_at_volume(f32::NAN), None);
+        assert_eq!(ch.volume_ml_at_time_min(-0.1), None);
+        assert_eq!(ch.volume_ml_at_time_min(5.0), None);
+        assert_eq!(ch.volume_ml_at_time_min(f32::NAN), None);
+    }
+
+    #[test]
+    fn a_single_sample_channel_maps_only_that_sample() {
+        let mut ch = Channel::new("MWave2", "UV 280 nm", ChannelKind::Uv);
+        ch.samples = vec![Sample::new(90.0, 1.5, 0.2)];
+        assert_eq!(ch.time_min_at_volume(1.5), Some(1.5));
+        assert_eq!(ch.volume_ml_at_time_min(1.5), Some(1.5));
+        assert_eq!(ch.time_min_at_volume(1.6), None);
+        assert_eq!(ch.volume_ml_at_time_min(0.0), None);
+    }
+
+    #[test]
+    fn an_empty_channel_has_nothing_to_map() {
+        let ch = Channel::new("MWave2", "UV 280 nm", ChannelKind::Uv);
+        assert_eq!(ch.time_min_at_volume(1.0), None);
+        assert_eq!(ch.volume_ml_at_time_min(1.0), None);
     }
 }
