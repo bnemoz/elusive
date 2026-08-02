@@ -511,6 +511,9 @@ pub enum SourceFormat {
     NgcAnalysis,
     NgcMethodruns,
     AnalysisCsv,
+    /// Cytiva/GE ÄKTA, UNICORN 6/7 result container. Recognised and inventoried,
+    /// but its curves are not decoded yet — see `parse::unicorn`.
+    UnicornResult,
 }
 
 impl SourceFormat {
@@ -518,7 +521,7 @@ impl SourceFormat {
     pub fn supports_fractions(self) -> bool {
         matches!(
             self,
-            SourceFormat::NgcAnalysis | SourceFormat::NgcMethodruns
+            SourceFormat::NgcAnalysis | SourceFormat::NgcMethodruns | SourceFormat::UnicornResult
         )
     }
 
@@ -527,6 +530,7 @@ impl SourceFormat {
             SourceFormat::NgcAnalysis => "NGC analysis archive",
             SourceFormat::NgcMethodruns => "NGC method-runs archive",
             SourceFormat::AnalysisCsv => "Analysis CSV",
+            SourceFormat::UnicornResult => "UNICORN result (ÄKTA)",
         }
     }
 }

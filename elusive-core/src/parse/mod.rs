@@ -6,6 +6,7 @@
 
 pub mod csv;
 pub mod ngc;
+pub mod unicorn;
 pub mod xml;
 
 use crate::error::{Error, Result};
@@ -13,7 +14,7 @@ use crate::model::Run;
 use std::path::Path;
 
 /// File extensions EluSive knows how to open, for a file dialog filter.
-pub const SUPPORTED_EXTENSIONS: &[&str] = &["ngcAnalysis", "ngcMethodruns", "csv"];
+pub const SUPPORTED_EXTENSIONS: &[&str] = &["ngcAnalysis", "ngcMethodruns", "csv", "res", "zip"];
 
 /// Open any supported run file, dispatching on extension.
 pub fn open(path: impl AsRef<Path>) -> Result<Run> {
@@ -27,6 +28,10 @@ pub fn open(path: impl AsRef<Path>) -> Result<Run> {
     {
         "ngcanalysis" | "ngcmethodruns" => ngc::open(path),
         "csv" => csv::open(path),
+        // ÄKTA. `.res` is ambiguous — UNICORN 5.x wrote a flat binary under it and
+        // 6/7 reuse it for a zip — so the module decides by content, not by the
+        // extension that got it here.
+        "res" | "zip" => unicorn::open(path),
         "" => Err(Error::unsupported(format!(
             "{} has no extension; expected one of {}",
             path.display(),

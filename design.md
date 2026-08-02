@@ -358,6 +358,36 @@ fractions, and the 96-well plate — which the generic mockup does not show.
 - [ ] Confirm `HEP96` geometry (8×12) and whether other rack types appear in your
       workflows (add to `wells` as needed).
 
+### 15.1 ÄKTA / UNICORN 6–7
+
+A second instrument family, tracked separately because none of it is answerable
+from documentation. Cytiva has never published the UNICORN result format; the
+public knowledge is reverse-engineered, and the widely used implementation
+(PyCORN) is GPL, so its **findings** may inform this work but its **code** may
+not be copied into an MIT/Apache crate.
+
+`parse/unicorn.rs` therefore ships as a container inventory, not a parser: it
+confirms the file is a UNICORN 6/7 zip and lists the entries into **Overview →
+Review required**, so a real export answers these instead of a guess doing it.
+UNICORN 5.x and earlier — a flat binary under the same `.res` extension — are out
+of scope by decision, not by omission.
+
+- [ ] Container layout: which entries hold curves, which hold the manifest, and
+      how a curve entry names the quantity it carries.
+- [ ] Curve encoding: sample type and endianness, and whether x is stored per
+      sample or implied by a start/step.
+- [ ] Whether x is volume, time, or both — the model needs both per `Sample`,
+      and `Channel::volume_ml_at_time_min` assumes a non-constant flow rate.
+- [ ] Value scale and unit per curve (the ÄKTA analogue of the NGC AU/mAU
+      question above, and the same hazard).
+- [ ] UV curve identity: which wavelength each `UV 1/2/3` curve carries, from the
+      manifest rather than from position.
+- [ ] Fraction records: ÄKTA marks fraction *starts*, so ends are inferred from
+      the next start — confirm, and set `Fraction::end_estimated` accordingly.
+- [ ] Rack and collection geometry for the fraction collector in use (Frac-950,
+      F9-C, F9-R …); extend `wells::RackGeometry` only once observed.
+- [ ] Whether the container carries V0/Vt, path length, or column identity.
+
 ---
 
 ## 16. Brand and visual design
