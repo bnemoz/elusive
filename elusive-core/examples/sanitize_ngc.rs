@@ -19,6 +19,11 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 const SENSITIVE_TAGS: &[&str] = &[
     "RunName",
+    // Analysis.xml embeds the run name a second time, as "Analysis of <run>".
+    // Redacting `RunName` alone left the original identifier in the archive —
+    // found by grepping the sanitizer's own output, which is why step 2 of the
+    // fixture procedure reads the result rather than trusting this list.
+    "AnalysisName",
     "SampleName",
     "UserName",
     "User",
