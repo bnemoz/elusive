@@ -217,17 +217,39 @@ fn non_uv_channels_are_not_rescaled() {
 }
 
 #[test]
-#[ignore = "design.md §15 box 2: the scale is right by luck. NGC traces declare \
-            no unit at all, so display_scale_for only ever reaches its magnitude \
-            heuristic ('peak below ~20 suggests AU'). It happens to be correct \
-            for this run. Make AU->mAU the known NGC convention and keep the \
-            heuristic for CSV, which genuinely declares nothing."]
 fn uv_scaling_does_not_rely_on_a_magnitude_guess() {
+    // AU storage is now applied as a verified property of the NGC format rather
+    // than inferred per trace from how tall its peaks happen to be. The old
+    // heuristic consulted amplitude on every UV trace, because an NGC header
+    // declares no unit at all — it got the right answer here and would have
+    // scaled a very dilute run differently from a saturated one.
     let run = fixture();
     assert!(
         !warned(&run, "suggests AU"),
-        "the AU convention is known for NGC; amplitude should not be consulted"
+        "the AU convention is known for NGC; amplitude must not be consulted"
     );
+    assert!(
+        !warned(&run, "unit not declared"),
+        "an absent unit is expected in this format, not worth reporting"
+    );
+}
+
+#[test]
+fn all_four_uv_traces_share_one_scale_despite_a_20x_spread() {
+    // MWave0 reaches 226.6 mAU and MWave3 only 0.61 — a ~370x spread across
+    // traces in the same file. Under the old magnitude test each was judged on
+    // its own amplitude, so they were only consistent by luck. Now the scale
+    // comes from the format, so consistency is structural.
+    let run = fixture();
+    let scales: Vec<f32> = ["MWave0", "MWave1", "MWave2", "MWave3"]
+        .iter()
+        .map(|id| channel(&run, id).display_scale)
+        .collect();
+    assert!(
+        scales.windows(2).all(|w| w[0] == w[1]),
+        "UV traces disagree on scale: {scales:?}"
+    );
+    assert_eq!(scales[0], 1000.0);
 }
 
 // ---------------------------------------------------------------------------
@@ -562,17 +584,19 @@ fn the_review_panel_reports_every_assumption_still_being_made() {
     // that closing a box *removes* a warning visibly and adding a new guess
     // without surfacing it fails the build.
     //
-    // Expected today: four UV magnitude guesses (the one remaining #[ignore]d
-    // test above) plus the Vt ambiguity, which is not a defect — it is the
-    // parser correctly declining to choose between two declared values.
+    // Down to one, and it is not a defect: the parser declining to choose
+    // between two declared Vt values is the panel doing its job.
     //
-    // Was six. The wavelength fallback and the spurious "malformed fraction
-    // record" are gone; the Vt warning is new and only became visible once the
-    // method XML was actually being read.
+    // The trajectory is the point. Six warnings became five when the method XML
+    // started being read (wavelength fallback and a spurious "malformed
+    // fraction record" gone, Vt ambiguity newly visible), then one when the AU
+    // convention replaced four per-trace magnitude guesses. Every removal came
+    // with a fixture test proving the fact that made the guess unnecessary —
+    // never by lowering the bar for what counts as an assumption.
     let run = fixture();
     assert_eq!(
         run.warnings.len(),
-        5,
+        1,
         "unexpected warning set:\n{}",
         run.warnings
             .iter()

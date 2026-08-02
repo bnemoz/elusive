@@ -223,10 +223,31 @@ the plate blank and does deserve an explanation.
 
 **Ambiguous column volumes are refused** — see Box 4 above.
 
-Warnings on this fixture went from six to five: the wavelength fallback and the
-spurious "malformed fraction record" are gone, the Vt ambiguity is new, and the
-four UV magnitude guesses remain. That last group is the only outstanding item,
-tracked by the single `#[ignore]`d test in `real_archive.rs`.
+**The UV scale is a convention, not an inference.** `display_scale_for` used to
+fall through to a magnitude test — "a peak under ~20 suggests AU" — whenever no
+unit was declared, which for NGC is *always*, since a trace header carries only
+`Version`, `OriginalRunDataId`, `TraceVersion`, `DeviceUID`, `TraceType` and
+`TraceData`. It gave the right answer on this run, but it chose the scale from
+the data: a very dilute run and a saturated one would have been scaled
+differently, with nothing on screen saying so.
+
+AU storage is now applied unconditionally for NGC UV traces, so the scale is a
+property of the file format. A declared unit still overrides it, in case a
+future ChromLab emits one. The magnitude test survives only as a plausibility
+guard on the *output*: a stored peak above 20 AU means ~20 000 mAU displayed,
+which no prep detector reaches, so it warns that the trace is probably already
+in mAU — while still applying the convention. Deliberately loud rather than
+quietly plausible; the old code silently switched to ×1 and produced a
+believable number.
+
+Warnings on this fixture went **six → five → one**. Gone: the wavelength
+fallback, the spurious "malformed fraction record", and four per-trace UV
+magnitude guesses. Remaining: the Vt ambiguity, which is not a defect but the
+parser correctly declining to choose between two declared values.
+
+Every removal came with a fixture test proving the fact that made the guess
+unnecessary. None came from lowering the bar for what counts as an assumption.
+`real_archive.rs` now has **no `#[ignore]`d tests**.
 
 ## Opportunity noted, not acted on
 

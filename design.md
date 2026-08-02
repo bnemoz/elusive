@@ -379,12 +379,15 @@ the fix. Run `cargo test -p elusive-core --test real_archive -- --ignored`.
       `MWave0`. The mapping code was always right; `is_method_entry` matched only
       `method/` while the archive uses `Methods/`, so the method XML was never
       read. Fixed 2026-08-02.
-- [ ] UV value scale: AU vs mAU. **Answered:** stored in **AU**, displayed as
-      **mAU** (×1000). Confirmed twice over — the raw payload peaks at 0.22661
-      and ChromLab's own stored `Height` is 0.227303, the difference being a
-      −0.0152 AU baseline. **Not implemented as a convention:** an NGC trace
-      header declares no unit at all, so `display_scale_for` only ever reaches
-      its magnitude heuristic; it is correct here by luck.
+- [x] UV value scale: AU vs mAU. **Answered and implemented.** Stored in **AU**,
+      displayed as **mAU** (×1000). Confirmed twice over — the raw payload peaks
+      at 0.22661 and ChromLab's own stored `Height` is 0.227303, the difference
+      being a −0.0152 AU baseline. Now applied as a property of the format
+      rather than inferred per trace from amplitude: an NGC header declares no
+      unit at all, so the old magnitude test ran on every UV trace and would
+      have scaled a very dilute run differently from a saturated one. A declared
+      unit still wins, and an implausible result is flagged without changing the
+      value.
 - [x] Reconcile the two `Trace_Fractions_*` files. **Answered and implemented.**
       It is not "full stream vs summary" — `Trace_Fractions_19.xml` is an empty
       `<Node />`. The populated entry wins; all 75 fractions carry a measured
