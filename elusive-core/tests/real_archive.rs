@@ -264,17 +264,23 @@ fn the_hero_trace_is_the_280_nm_channel() {
 }
 
 #[test]
-#[ignore = "design.md §15 box 1: the wavelengths above are correct only because \
-            this run happens to match DEFAULT_WAVELENGTHS. The parser reports \
-            'no wavelength mapping found in the method XML' and falls back to \
-            positional order — it never finds the <Wavelength1..4> elements that \
-            are demonstrably present. Point wavelength_for at them, remembering \
-            the 1-based/0-based offset."]
 fn wavelengths_are_read_from_the_method_not_assumed_from_order() {
+    // The mapping logic was always correct, including the 1-based/0-based
+    // offset. The bug was upstream in `is_method_entry`, which matched only
+    // `method/` while this archive uses `Methods/` — so the method XML was
+    // never read and `resolve_wavelengths` was handed an empty slice.
+    //
+    // Because the fallback order happens to equal this run's true mapping, the
+    // values looked right the whole time. Only the warning revealed it, which is
+    // the argument for warning about assumptions rather than quietly making them.
     let run = fixture();
     assert!(
         !warned(&run, "no wavelength mapping found"),
         "the method declares all four wavelengths; they must not be assumed"
+    );
+    assert!(
+        !warned(&run, "of 4 UV wavelengths"),
+        "all four are declared, so no partial-fallback warning either"
     );
 }
 
@@ -359,16 +365,23 @@ fn the_first_fraction_starts_where_the_method_says() {
 }
 
 #[test]
-#[ignore = "design.md §15 box 3: the empty second fraction trace is normal, not \
-            broken. Trace_Fractions_19.xml contains <RootNodeOfCFCData><Node /> \
-            </RootNodeOfCFCData> and the parser raises 'malformed fraction \
-            record'. Reconciliation should treat an empty companion trace as \
-            benign and warn only when both are populated and disagree."]
 fn an_empty_companion_fraction_trace_is_not_reported_as_malformed() {
+    // Two fraction traces with one empty is how this format normally looks, so
+    // calling it malformed put a red herring in the Review-required panel on
+    // every run. That matters more than it sounds: the panel is the only place
+    // real assumptions surface, and one that always cries wolf stops being read.
+    //
+    // An empty source is now simply dropped during reconciliation. The genuine
+    // failure — *every* source empty — still warns; see the unit tests in
+    // `ngc.rs` for that path, which this fixture cannot exercise.
     let run = fixture();
     assert!(
         !warned(&run, "no <CFCData> records found"),
         "an empty duplicate trace is expected in this format, not an error"
+    );
+    assert!(
+        !warned(&run, "none held any records"),
+        "one source is populated, so the all-empty warning must stay silent"
     );
 }
 
@@ -437,25 +450,60 @@ fn serpentine_numbering_places_the_first_row_left_to_right() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn the_method_does_not_supply_column_volumes() {
-    // Searched Methods/MethodData1.xml for Void, V0, Vt, BedVolume and
-    // TotalVolume: none exists. Kav-based fitting therefore cannot be
-    // automatic, and the volume-based fallback is the correct default.
-    // This asserts a *negative* finding so that a future archive which does
-    // carry them announces itself by failing here.
+fn no_void_volume_is_declared_so_kav_cannot_be_automatic() {
+    // V0 is genuinely absent — no Void, V0, ColumnVoidVolume or VoidVolumeMl
+    // anywhere in the method. Kav-based fitting needs both V0 and Vt, so the
+    // volume-based fallback stays correct. Asserted as a negative finding so
+    // that an archive which *does* carry it announces itself by failing here.
     let run = fixture();
     assert_eq!(run.meta.v0_ml, None);
-    assert_eq!(run.meta.vt_ml, None);
 }
 
 #[test]
-#[ignore = "design.md §15 box 4: the column is identified but not read. \
-            Methods/MethodData1.xml carries <ColumnType>Superdex 200 10/300 GL \
-            </ColumnType> and RunMeta.column already exists, unpopulated. A \
-            named column has published V0/Vt (≈8 mL void, ≈24 mL bed), so this \
-            could offer values for the user to confirm — offered and labelled, \
-            never silently assumed."]
+fn an_ambiguous_column_volume_is_refused_rather_than_guessed() {
+    // The method declares <ColumnVolume> twice, as `1` and as
+    // `23.5619449019234`. The larger is unmistakably real — it is exactly
+    // pi * 0.5^2 * 30, the geometric volume of a 10 mm x 30 cm column, which
+    // matches the declared Superdex 200 10/300 GL. But nothing in the document
+    // says so, and resolving it by document order is a coin flip.
+    //
+    // This behaviour only became reachable once `is_method_entry` was fixed to
+    // match `Methods/`: before that the method was never read, so the ambiguity
+    // was invisible rather than absent. Adopting `1` as Vt would have distorted
+    // every Kav molecular weight by ~23x without looking wrong on screen.
+    let run = fixture();
+    assert_eq!(
+        run.meta.vt_ml, None,
+        "an ambiguous Vt must not be adopted silently"
+    );
+    assert!(
+        warned(&run, "different Vt values"),
+        "refusing to choose is only acceptable if the user is told why"
+    );
+    // The warning has to be actionable: name the candidates and the way out.
+    let w = run
+        .warnings
+        .iter()
+        .find(|w| w.message.contains("different Vt values"))
+        .expect("the Vt ambiguity warning");
+    assert!(
+        w.message.contains("23.561945"),
+        "name the real candidate: {}",
+        w.message
+    );
+    assert!(
+        w.message.contains("Calibration"),
+        "point at the fix: {}",
+        w.message
+    );
+}
+
+#[test]
 fn the_column_identity_is_read_from_the_method() {
+    // Fixed by the same one-character `Methods/` correction as the wavelengths.
+    // Worth having on its own: a named column has published V0/Vt, so this is
+    // what a future lookup would key on to *offer* values for the user to
+    // confirm — offered and labelled, never silently assumed.
     let run = fixture();
     assert_eq!(run.meta.column.as_deref(), Some("Superdex 200 10/300 GL"));
 }
@@ -465,15 +513,25 @@ fn the_column_identity_is_read_from_the_method() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "design.md §15 box 5: Analysis.xml records <PathLength>0.5</PathLength> \
-            on all 58 peaks, but nothing reads it and RunMeta.path_length_cm stays \
-            None — so the UI falls back to ConcentrationInputs::default(), which \
-            is 0.2 cm and wrong for this instrument by a factor of 2.5, straight \
-            into the concentration estimate. Note Analysis.xml exists only in \
-            .ngcAnalysis exports; .ngcMethodruns may not carry it."]
 fn the_flow_cell_path_length_is_read_from_the_archive() {
+    // 0.5 cm, stamped on all 58 ChromLab peak records in Analysis.xml. It is not
+    // in the method, so `fill_meta` falls back to the run-side leaves — which
+    // include Analysis.xml, since `is_run_info_entry` folds it in.
+    //
+    // Previously this came back None and the UI used ConcentrationInputs'
+    // 0.2 cm default: a 2.5x error travelling straight into Beer-Lambert. Of
+    // everything found in this archive it is the number most likely to have
+    // been acted on without anyone noticing, because a concentration that is
+    // 2.5x wrong still looks like a concentration.
+    //
+    // Caveat: Analysis.xml exists only in .ngcAnalysis exports. A
+    // .ngcMethodruns archive may legitimately have no path length, and the
+    // manual entry in Calibration remains the fallback.
     let run = fixture();
-    let path = run.meta.path_length_cm.expect("path length");
+    let path = run
+        .meta
+        .path_length_cm
+        .expect("path length from Analysis.xml");
     assert!((path - 0.5).abs() < 1e-6, "expected 0.5 cm, got {path}");
 }
 
@@ -504,13 +562,17 @@ fn the_review_panel_reports_every_assumption_still_being_made() {
     // that closing a box *removes* a warning visibly and adding a new guess
     // without surfacing it fails the build.
     //
-    // Expected today: one wavelength fallback, four UV magnitude guesses, and
-    // one spurious "malformed" for the empty companion fraction trace. Each has
-    // an #[ignore]d test above naming the fix.
+    // Expected today: four UV magnitude guesses (the one remaining #[ignore]d
+    // test above) plus the Vt ambiguity, which is not a defect — it is the
+    // parser correctly declining to choose between two declared values.
+    //
+    // Was six. The wavelength fallback and the spurious "malformed fraction
+    // record" are gone; the Vt warning is new and only became visible once the
+    // method XML was actually being read.
     let run = fixture();
     assert_eq!(
         run.warnings.len(),
-        6,
+        5,
         "unexpected warning set:\n{}",
         run.warnings
             .iter()

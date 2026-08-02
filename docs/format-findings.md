@@ -126,23 +126,48 @@ HEP96 8×12 serpentine is confirmed against a real run. The remaining half of
 this box — whether *other* rack types appear in the user's workflows — is a
 question about lab practice, not about the format, and stays open.
 
-## Box 4 — V0/Vt: **not present.** Confirmed absent.
+## Box 4 — V0 absent, Vt declared but ambiguous.
 
-No `Void`, `V0`, `Vt`, `BedVolume`, or `TotalVolume` element exists anywhere in
-`Methods/MethodData1.xml`. Kav-based fitting cannot be automatic; the volume-based
-fallback is correct and stays.
+> **Corrected 2026-08-02.** An earlier pass recorded "V0/Vt not present". That
+> was wrong on Vt, and wrong for an instructive reason: the survey grep
+> truncated its results to six per keyword, and `is_method_entry` was matching
+> only `method/` so the method XML was not being read at all. Two independent
+> mistakes agreeing on a wrong answer.
 
-But the column *identity* is recorded:
+**V0 is genuinely absent.** No `Void`, `V0`, `ColumnVoidVolume` or
+`VoidVolumeMl` anywhere in `Methods/MethodData1.xml`. Kav-based fitting needs
+both, so it cannot be automatic and the volume-based fallback stays correct.
+
+**Vt is declared twice, with different values:**
+
+```xml
+<ColumnVolume>1</ColumnVolume>
+<ColumnVolume>23.5619449019234</ColumnVolume>
+<ColumnVolumePrev>23.5619449019234</ColumnVolumePrev>
+```
+
+The larger is unmistakably the real bed volume — it is exactly π × 0.5² × 30,
+the geometric volume of a 10 mm × 30 cm column, matching the declared Superdex
+200 10/300 GL — and `ColumnVolumePrev` corroborates it. But nothing *in the
+document* marks one as authoritative, and `first_text_any` resolved it by
+document order, which is a coin flip. Adopting `1` as Vt would have skewed every
+Kav molecular weight by ~23× while still looking like a plausible number.
+
+The parser now refuses: when candidates disagree it adopts none and raises a
+warning naming them and pointing at manual entry in Calibration. Losing an
+automatic fill costs far less than planting a silent 23× error, and Vt alone
+cannot drive Kav anyway while V0 is missing.
+
+The column *identity* is recorded and is now read into `RunMeta.column`:
 
 ```xml
 <ColumnType>Superdex 200 10/300 GL</ColumnType>
 <ColumnPosition>C2 Port 5</ColumnPosition>
 ```
 
-`RunMeta.column` already exists and should be populated from this. A named
-column has published V0/Vt (a Superdex 200 10/300 GL is ≈24 mL bed, ≈8 mL void),
-so a small lookup table could *offer* values for the user to confirm — offered
-and labelled, never silently assumed.
+A named column has published V0/Vt (≈24 mL bed, ≈8 mL void for this one), so a
+lookup table could *offer* values for the user to confirm — offered and
+labelled, never silently assumed.
 
 ## Box 5 — path length and ε: path length yes, ε no. Confirmed.
 
@@ -170,6 +195,38 @@ e-mail addresses.
 
 `ColumnType` and `ColumnPosition` are deliberately **not** redacted — they are
 instrument configuration, not sample identity, and Box 4 needs them.
+
+## Fixes applied (2026-08-02)
+
+Four defects, three of them traced to one line.
+
+**`is_method_entry` matched only `method/`.** The archive uses `Methods/`
+(plural, numbered). The method XML was therefore never read, which by itself
+caused: the wavelength fallback warning, the missing `ColumnType`, and the
+inability to see the Vt ambiguity at all. `resolve_wavelengths` had been correct
+the whole time — including the 1-based/0-based offset — it was simply handed an
+empty slice. Because `DEFAULT_WAVELENGTHS` happens to equal this run's true
+mapping, the *values* looked right and only the warning betrayed it.
+
+**Path length was searched only in the method.** It lives in `Analysis.xml`,
+which `is_run_info_entry` folds into the run-side leaves. `fill_meta` now falls
+back there, so `RunMeta.path_length_cm` is 0.5 cm instead of `None`, and the UI
+stops using its 0.2 cm default. This is the one number here most likely to have
+been acted on unnoticed, since a concentration 2.5× wrong still looks like a
+concentration.
+
+**An empty companion fraction trace was reported as malformed.** It is normal
+for one of the two entries to be a bare `<Node />`. `parse_fraction_payload`
+now returns an empty source, which `reconcile_fraction_sources` already
+discards; a warning fires only when *every* source is empty, which would leave
+the plate blank and does deserve an explanation.
+
+**Ambiguous column volumes are refused** — see Box 4 above.
+
+Warnings on this fixture went from six to five: the wavelength fallback and the
+spurious "malformed fraction record" are gone, the Vt ambiguity is new, and the
+four UV magnitude guesses remain. That last group is the only outstanding item,
+tracked by the single `#[ignore]`d test in `real_archive.rs`.
 
 ## Opportunity noted, not acted on
 

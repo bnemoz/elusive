@@ -4,8 +4,9 @@
 //!
 //! ```text
 //! Version.txt                              (methodruns only)
-//! Method/MethodData.xml, MethodInfo.xml
-//! Runs/Run1.xml, RunInfo1.xml
+//! Methods/MethodData1.xml, MethodInfo1.xml (also seen as Method/ without the 1)
+//! Runs/Run1.xml, Runs/RunInfo1.xml
+//! Runs/AnalysisRunViewSettings1.xml
 //! Runs/Run1/Trace_<Name>_<idx>.xml
 //! Analysis.xml                             (analysis export only)
 //! ```
@@ -90,7 +91,7 @@ pub fn from_reader<R: Read + Seek>(reader: R, path: &Path, format: SourceFormat)
         }
     }
 
-    fill_meta(&mut meta, &run_leaves, &method_leaves);
+    fill_meta(&mut meta, &run_leaves, &method_leaves, &mut warnings);
     if meta.run_name.is_empty() {
         meta.run_name = path
             .file_stem()
@@ -209,7 +210,18 @@ fn normalise(entry: &str) -> String {
 
 fn is_method_entry(entry: &str) -> bool {
     let e = normalise(entry);
-    e.starts_with("method/") && e.ends_with(".xml")
+    if !e.ends_with(".xml") {
+        return false;
+    }
+    // Both spellings, because the real archive disagreed with the spec. A
+    // Superdex SEC export from ChromLab puts the method in `Methods/` (plural,
+    // and the files are numbered: `Methods/MethodData1.xml`), while `design.md`
+    // §3 documented `Method/`. Matching only the singular meant the method XML
+    // was never read at all, which is why the wavelength mapping silently fell
+    // back to positional order and `ColumnType` never reached `RunMeta` — one
+    // missing letter, two wrong answers downstream.
+    let (dir, _) = e.split_once('/').unwrap_or(("", ""));
+    dir == "method" || dir == "methods"
 }
 
 fn is_run_info_entry(entry: &str) -> bool {
@@ -621,7 +633,61 @@ fn wavelength_in_text(text: &str) -> Option<u16> {
 
 // --- Metadata ---------------------------------------------------------------
 
-fn fill_meta(meta: &mut RunMeta, run_leaves: &[Leaf], method_leaves: &[Leaf]) {
+/// A column volume, but only when the method says one thing.
+///
+/// `ColumnVolume` is not unique in a ChromLab method: the observed archive holds
+/// both `23.5619449019234` — the true bed volume of a 10 mm x 30 cm column, and
+/// exactly pi*0.5^2*30 — and a bare `1` under the same element name somewhere
+/// else in the document. `first_text_any` would resolve that by document order,
+/// which is a coin flip, and a Vt of 1 mL instead of 23.6 mL would distort every
+/// Kav-based molecular weight without looking obviously wrong.
+///
+/// So when the candidates disagree this reports the ambiguity and yields
+/// nothing. `design.md` is explicit that a plausible wrong number is worse than
+/// an admitted unknown, and the Calibration tab already accepts the value by
+/// hand — losing an automatic fill is a far smaller cost than a silent 23x error.
+fn unambiguous_volume(
+    leaves: &[Leaf],
+    names: &[&str],
+    label: &str,
+    warnings: &mut Vec<Warning>,
+) -> Option<f32> {
+    let mut candidates: Vec<f32> = xml::all_texts_any(leaves, names)
+        .iter()
+        .filter_map(|t| xml::parse_f32(t))
+        .filter(|v| *v > 0.0)
+        .collect();
+    candidates.sort_by(|a, b| a.total_cmp(b));
+    candidates.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+
+    match candidates.len() {
+        0 => None,
+        1 => Some(candidates[0]),
+        _ => {
+            warnings.push(Warning::new(
+                "calibration",
+                format!(
+                    "the method declares {} different {label} values ({}); none was adopted \
+                     because picking one would be a guess. Enter {label} by hand in Calibration.",
+                    candidates.len(),
+                    candidates
+                        .iter()
+                        .map(|v| format!("{v} mL"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ));
+            None
+        }
+    }
+}
+
+fn fill_meta(
+    meta: &mut RunMeta,
+    run_leaves: &[Leaf],
+    method_leaves: &[Leaf],
+    warnings: &mut Vec<Warning>,
+) {
     let pick = |leaves: &[Leaf], names: &[&str]| xml::first_text_any(leaves, names);
 
     meta.run_name = pick(run_leaves, &["RunName", "Name", "Title"]).unwrap_or_default();
@@ -639,34 +705,40 @@ fn fill_meta(meta: &mut RunMeta, run_leaves: &[Leaf], method_leaves: &[Leaf]) {
     meta.column = pick(method_leaves, &["Column", "ColumnName", "ColumnType"])
         .or_else(|| pick(run_leaves, &["Column", "ColumnName"]));
 
-    meta.v0_ml = pick(
+    meta.v0_ml = unambiguous_volume(
         method_leaves,
         &["VoidVolume", "V0", "ColumnVoidVolume", "VoidVolumeMl"],
-    )
-    .as_deref()
-    .and_then(xml::parse_f32)
-    .filter(|v| *v > 0.0);
+        "V0",
+        warnings,
+    );
 
-    meta.vt_ml = pick(
+    meta.vt_ml = unambiguous_volume(
         method_leaves,
         &["ColumnVolume", "Vt", "TotalVolume", "BedVolume"],
-    )
-    .as_deref()
-    .and_then(xml::parse_f32)
-    .filter(|v| *v > 0.0);
+        "Vt",
+        warnings,
+    );
 
-    meta.path_length_cm = pick(
-        method_leaves,
-        &[
-            "PathLength",
-            "PathLengthCm",
-            "CellPathLength",
-            "FlowCellPathLength",
-        ],
-    )
-    .as_deref()
-    .and_then(xml::parse_f32)
-    .filter(|v| *v > 0.0);
+    // Path length is the one flow-cell property the archive actually carries,
+    // and it is not in the method: ChromLab stamps it onto every peak record in
+    // `Analysis.xml`, which `is_run_info_entry` folds into `run_leaves`. The
+    // method is still searched first in case another ChromLab version records it
+    // there, but the run-side fallback is what finds it in practice.
+    //
+    // Getting this wrong is not cosmetic. With no value the UI falls back to a
+    // 0.2 cm default, and a real NGC flow cell is 0.5 cm — a 2.5x error landing
+    // directly in the Beer-Lambert concentration.
+    const PATH_LENGTH_NAMES: &[&str] = &[
+        "PathLength",
+        "PathLengthCm",
+        "CellPathLength",
+        "FlowCellPathLength",
+    ];
+    meta.path_length_cm = pick(method_leaves, PATH_LENGTH_NAMES)
+        .or_else(|| pick(run_leaves, PATH_LENGTH_NAMES))
+        .as_deref()
+        .and_then(xml::parse_f32)
+        .filter(|v| *v > 0.0);
 }
 
 // --- Fractions --------------------------------------------------------------
@@ -687,7 +759,17 @@ fn parse_fraction_payload(entry: &str, blob: &[u8]) -> Result<Vec<Fraction>> {
 
     let records = xml::records(entry, &text, "CFCData")?;
     if records.is_empty() {
-        return Err(Error::fractions(entry, "no <CFCData> records found"));
+        // An empty companion is normal, not broken. A real archive carries two
+        // `Trace_Fractions_*` entries and only one is populated — the observed
+        // pair was 350 KB of records against a bare
+        // `<RootNodeOfCFCData><Node /></RootNodeOfCFCData>`. Treating that as a
+        // malformed record put a red herring in the Review-required panel on
+        // every single run, which is corrosive: a panel that always cries wolf
+        // stops being read, and it is the one place real assumptions surface.
+        //
+        // Returning an empty source is safe because `reconcile_fraction_sources`
+        // already drops empty candidates, and warns if *every* source was empty.
+        return Ok(Vec::new());
     }
 
     // A tube may appear twice, once as FractionStart and once as FractionDone;
@@ -797,8 +879,22 @@ fn reconcile_fraction_sources(
     mut sources: Vec<(String, Vec<Fraction>)>,
     warnings: &mut Vec<Warning>,
 ) -> Vec<Fraction> {
+    let offered = sources.len();
     sources.retain(|(_, f)| !f.is_empty());
     if sources.is_empty() {
+        // One empty fraction trace beside a populated one is routine and stays
+        // silent. Every source being empty is different: the run either
+        // collected nothing or we failed to read what it collected, and the
+        // plate will be blank either way, so the user is owed an explanation.
+        if offered > 0 {
+            warnings.push(Warning::new(
+                "fractions",
+                format!(
+                    "{offered} fraction trace(s) were present but none held any records; \
+                     the plate view will be empty"
+                ),
+            ));
+        }
         return Vec::new();
     }
     if sources.len() == 1 {
@@ -993,7 +1089,117 @@ mod tests {
         assert!(is_run_info_entry("Runs/Run1.xml"));
         assert!(is_run_info_entry("Runs/RunInfo1.xml"));
         assert!(is_method_entry("Method/MethodData.xml"));
+        // The plural spelling is what a real ChromLab export actually uses.
+        // Missing it meant the method XML was never read, which silently cost us
+        // the wavelength mapping and the column identity.
+        assert!(is_method_entry("Methods/MethodData1.xml"));
+        assert!(is_method_entry("Methods/MethodInfo1.xml"));
         assert!(!is_method_entry("Runs/Run1.xml"));
+        // Guard the boundary: only a leading path segment counts, so an entry
+        // that merely begins with those letters is not a method file.
+        assert!(!is_method_entry("MethodologyNotes/readme.xml"));
+        assert!(!is_method_entry("Runs/Method/Trace_x.xml"));
+    }
+
+    #[test]
+    fn a_single_declared_column_volume_is_adopted() {
+        let leaves = vec![Leaf {
+            name: "ColumnVolume".into(),
+            text: "23.5619449019234".into(),
+            attrs: Vec::new(),
+        }];
+        let mut warnings = Vec::new();
+        let v = unambiguous_volume(&leaves, &["ColumnVolume"], "Vt", &mut warnings);
+        assert_eq!(v, Some(23.561_945));
+        assert!(warnings.is_empty(), "one clear value needs no warning");
+    }
+
+    #[test]
+    fn conflicting_column_volumes_are_refused_and_reported() {
+        // The real archive declares <ColumnVolume> as both `1` and
+        // `23.5619449019234`. Document order decided which one won, and adopting
+        // `1` as Vt would have skewed every Kav molecular weight by ~23x while
+        // still looking like a plausible number.
+        let leaves = vec![
+            Leaf {
+                name: "ColumnVolume".into(),
+                text: "1".into(),
+                attrs: Vec::new(),
+            },
+            Leaf {
+                name: "ColumnVolume".into(),
+                text: "23.5619449019234".into(),
+                attrs: Vec::new(),
+            },
+        ];
+        let mut warnings = Vec::new();
+        let v = unambiguous_volume(&leaves, &["ColumnVolume"], "Vt", &mut warnings);
+        assert_eq!(v, None, "ambiguity must not resolve to a guess");
+        assert_eq!(warnings.len(), 1);
+        let m = &warnings[0].message;
+        assert!(m.contains("1 mL") && m.contains("23.561945"), "{m}");
+        assert!(m.contains("Calibration"), "must say how to proceed: {m}");
+    }
+
+    #[test]
+    fn repeated_but_identical_volumes_are_not_an_ambiguity() {
+        // ChromLab repeats the same value in more than one place. Agreement is
+        // not a conflict, so this must not trip the refusal path.
+        let leaves = vec![
+            Leaf {
+                name: "ColumnVolume".into(),
+                text: "23.5619449019234".into(),
+                attrs: Vec::new(),
+            },
+            Leaf {
+                name: "ColumnVolumePrev".into(),
+                text: "23.5619449019234".into(),
+                attrs: Vec::new(),
+            },
+        ];
+        let mut warnings = Vec::new();
+        let v = unambiguous_volume(
+            &leaves,
+            &["ColumnVolume", "ColumnVolumePrev"],
+            "Vt",
+            &mut warnings,
+        );
+        assert_eq!(v, Some(23.561_945));
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn an_empty_fraction_payload_yields_no_records_rather_than_an_error() {
+        // A real archive carries two Trace_Fractions_* entries with only one
+        // populated; the other is a bare <Node />. Calling that malformed put a
+        // permanent false alarm in the Review-required panel.
+        let xml = concat!(
+            r#"<?xml version="1.0"?>"#,
+            "<RootNodeOfCFCData><Node /></RootNodeOfCFCData>"
+        );
+        let encoded = base64::engine::general_purpose::STANDARD.encode(xml);
+        let blob = decode_base64("Trace_Fractions_19.xml", &encoded).expect("decodes");
+        let out = parse_fraction_payload("Trace_Fractions_19.xml", &blob)
+            .expect("an empty companion is benign, not an error");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn every_fraction_source_being_empty_is_still_reported() {
+        // The benign case above must not swallow the real failure: if nothing
+        // anywhere held records the plate will be blank, and silence would leave
+        // the user with no explanation.
+        let mut warnings = Vec::new();
+        let out = reconcile_fraction_sources(
+            vec![
+                ("Trace_Fractions_1.xml".to_string(), Vec::new()),
+                ("Trace_Fractions_19.xml".to_string(), Vec::new()),
+            ],
+            &mut warnings,
+        );
+        assert!(out.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].message.contains("none held any records"));
     }
 
     #[test]

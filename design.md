@@ -373,32 +373,36 @@ does the right thing, not merely when the format is understood — four are
 answered but not yet implemented, and each carries an `#[ignore]`d test naming
 the fix. Run `cargo test -p elusive-core --test real_archive -- --ignored`.
 
-- [ ] `MWave0..3` → wavelength mapping. **Answered:** `Methods/MethodData1.xml`
-      declares `<Wavelength1..4>` = 215/255/280/495, numbered from 1 while traces
-      number from 0, so `Wavelength1` belongs to `MWave0`. **Not implemented:**
-      the parser never finds them and falls back to positional order, which is
-      right for this run only by coincidence.
+- [x] `MWave0..3` → wavelength mapping. **Answered and implemented.**
+      `Methods/MethodData1.xml` declares `<Wavelength1..4>` = 215/255/280/495,
+      numbered from 1 while traces number from 0, so `Wavelength1` belongs to
+      `MWave0`. The mapping code was always right; `is_method_entry` matched only
+      `method/` while the archive uses `Methods/`, so the method XML was never
+      read. Fixed 2026-08-02.
 - [ ] UV value scale: AU vs mAU. **Answered:** stored in **AU**, displayed as
       **mAU** (×1000). Confirmed twice over — the raw payload peaks at 0.22661
       and ChromLab's own stored `Height` is 0.227303, the difference being a
       −0.0152 AU baseline. **Not implemented as a convention:** an NGC trace
       header declares no unit at all, so `display_scale_for` only ever reaches
       its magnitude heuristic; it is correct here by luck.
-- [x] Reconcile the two `Trace_Fractions_*` files. **Answered:** it is not
-      "full stream vs summary" — `Trace_Fractions_19.xml` is an empty
-      `<Node />`. Prefer the populated entry; all 75 fractions carry a measured
-      `FractionDone`, so no boundary is inferred. Behaviour verified; one
-      cosmetic gap remains (the empty companion is reported as malformed).
-- [x] V0/Vt for Kav-based SEC calibration. **Answered: absent.** No `Void`,
-      `V0`, `Vt`, `BedVolume` or `TotalVolume` anywhere in the method, so the
-      volume-based fit is correct and stays. `<ColumnType>Superdex 200 10/300
-      GL</ColumnType>` *is* recorded and is not yet read into `RunMeta.column`.
-- [ ] Path length + ε for concentration. **Answered:** `Analysis.xml` records
-      `<PathLength>0.5</PathLength>` on all 58 peaks, and
-      `<ExtinctionCoefficient xsi:nil="true"/>` on all of them — so ε is
-      genuinely absent and stays a manual input. **Not implemented:** nothing
-      reads the path length, so the UI uses a 0.2 cm default that is wrong for
-      this instrument by 2.5×, directly into the concentration estimate.
+- [x] Reconcile the two `Trace_Fractions_*` files. **Answered and implemented.**
+      It is not "full stream vs summary" — `Trace_Fractions_19.xml` is an empty
+      `<Node />`. The populated entry wins; all 75 fractions carry a measured
+      `FractionDone`, so no boundary is inferred. An empty companion is now
+      benign, and a warning fires only if *every* source is empty.
+- [x] V0/Vt for Kav-based SEC calibration. **Answered.** V0 is genuinely absent,
+      so Kav cannot be automatic and the volume-based fit stays. Vt *is*
+      declared — but twice, as `1` and `23.5619449019234` (exactly π·0.5²·30 for
+      the declared Superdex 200 10/300 GL). The parser refuses an ambiguous
+      value and says so rather than resolving it by document order.
+      `<ColumnType>` is now read into `RunMeta.column`.
+- [x] Path length + ε for concentration. **Answered and implemented.**
+      `Analysis.xml` records `<PathLength>0.5</PathLength>` on all 58 peaks and
+      `<ExtinctionCoefficient xsi:nil="true"/>` on all of them, so ε is genuinely
+      absent and stays a manual input by design. Path length is now read from the
+      run-side leaves; previously the UI fell back to 0.2 cm, wrong for this
+      instrument by 2.5× and straight into the concentration estimate. Note
+      `Analysis.xml` exists only in `.ngcAnalysis` exports.
 - [x] Plate heatmap colormap + colorblind option — resolved in DESIGN_SYSTEM.md §10.3.
 - [x] Channel overflow beyond 8 series — resolved in DESIGN_SYSTEM.md §10.4.
 - [x] `HEP96` geometry (8×12). **Answered and verified:** all 150 fraction
