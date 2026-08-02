@@ -304,7 +304,7 @@ pub fn decode_signal_blob(entry: &str, blob: &[u8]) -> Result<(Vec<Sample>, Opti
     }
     let version = u32::from_le_bytes([blob[0], blob[1], blob[2], blob[3]]);
     let body = &blob[4..];
-    if body.len() % RECORD_BYTES != 0 {
+    if !body.len().is_multiple_of(RECORD_BYTES) {
         return Err(Error::trace(
             entry,
             format!(

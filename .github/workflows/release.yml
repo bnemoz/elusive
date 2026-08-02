@@ -127,7 +127,7 @@ jobs:
           # A hyphenated version (v0.1.0-alpha.1) marks a pre-release.
           prerelease: ${{ contains(github.ref_name, '-') }}
           body: |
-            **EluSive ${{ github.ref_name }}** — an early build for real-world testing.
+            **EluSive ${{ github.ref_name }}**
 
             Windows: download `elusive-windows-x86_64.zip`, unzip it anywhere, and run
             `elusive.exe`. Keep the `assets/` folder next to the binary. The build is

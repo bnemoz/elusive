@@ -89,7 +89,11 @@ pub fn well_for_tube(
             let row = index / cols;
             let pos = index % cols;
             // Even rows run left→right, odd rows right→left.
-            let col = if row % 2 == 0 { pos } else { cols - 1 - pos };
+            let col = if row.is_multiple_of(2) {
+                pos
+            } else {
+                cols - 1 - pos
+            };
             (row, col)
         }
         CollectionPattern::Columns => (index % rows, index / rows),
