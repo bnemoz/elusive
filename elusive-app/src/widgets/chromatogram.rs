@@ -5,6 +5,17 @@
 //! conductivity onto the UV axis — would put a number on screen that is not the
 //! number the instrument measured, so it is not on the table.
 //!
+//! Within a group the same tension reappears for a legitimate reason: a 280 nm
+//! trace at 2000 mAU and a 260 nm trace at 40 mAU share an axis *and* a unit, but
+//! the small one is a flat line along the bottom and cannot be read.
+//! [`YScaleMode`] answers that by remapping each trace onto a shared **unitless**
+//! axis — and the module keeps its principle by refusing to label that axis in
+//! mAU once it no longer means mAU. When per-trace scaling is on, the axis reads
+//! "relative", the hover readout says so, and every scaled channel carries a text
+//! badge in the legend. A normalized overlay that still looks like a true
+//! comparison is exactly the kind of plausible-but-wrong picture this tool exists
+//! to avoid.
+//!
 //! The x axis shows either elution volume or elution time, per [`XAxis`]. That
 //! choice stops at the edge of this module: everything entering it (peaks,
 //! fractions, excluded regions, hover state) and everything leaving it
@@ -12,10 +23,12 @@
 
 use crate::egui_adapter::{self as adapt, c, c_alpha, ca};
 use crate::theme::{chart, color, spacing, stroke, Rgb, Theme};
-use crate::view::{Interaction, View, XAxis};
+use crate::view::{Interaction, View, XAxis, YScaleMode};
 use egui::Ui;
 use egui_plot::{Line, Plot, PlotPoints, Polygon};
-use elusive_core::model::{AxisGroup, Channel, Color, Fraction, PeakId, PeakResult, Run, Sample};
+use elusive_core::model::{
+    AxisGroup, Channel, ChannelId, Color, Fraction, PeakId, PeakResult, Run, Sample,
+};
 
 /// Fraction of the pane's height given to the hero (UV) group.
 const HERO_HEIGHT_SHARE: f32 = 0.55;
@@ -37,11 +50,16 @@ pub struct ChartOutcome {
     pub interaction: Option<Interaction>,
     /// Elution volume under the pointer, when it is over one of the plots.
     pub hovered_volume: Option<f32>,
-    /// Screen rect the stacked plots occupy, in logical points.
+    /// Screen rect the stacked plots occupy, in logical points, unioned with the
+    /// relative-axis caveat when that is showing.
     ///
     /// Reported for the same reason as everything else here: the pane does not
     /// know that anyone wants to photograph it. `app` uses this to crop a
     /// framebuffer capture down to the chart. `None` when nothing was drawn.
+    ///
+    /// The caveat is inside the crop deliberately: a PNG of normalized traces
+    /// that leaves the "heights are not comparable" line behind is precisely the
+    /// plausible-but-wrong picture the mode exists to prevent.
     pub rect: Option<egui::Rect>,
 }
 
@@ -58,6 +76,14 @@ pub fn show(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) -> ChartOutcome {
     }
 
     let mut outcome = ChartOutcome::default();
+    if view.y_scale_mode.is_per_trace() {
+        let note = relative_axis_note(ui, t);
+        if note.is_positive() {
+            outcome.rect = Some(note);
+        }
+    }
+    // Read *after* the note, so the plots are laid out in what is actually left
+    // rather than in space the note has already taken.
     let total = ui.available_height();
     let heights = group_heights(&groups, total);
     let count = groups.len();
@@ -84,6 +110,36 @@ pub fn show(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) -> ChartOutcome {
         }
     }
     outcome
+}
+
+/// The standing caveat that per-trace scaling removes the one thing a shared
+/// axis gives you: comparable heights.
+///
+/// Always on screen while the mode is active rather than shown once and
+/// dismissed — someone reading over a colleague's shoulder, or a screenshot in a
+/// notebook, has to carry the caveat with the picture. Text carries the meaning,
+/// so it survives colour-blind vision and a greyscale print (rule #3).
+///
+/// Returns the rect it drew into, which joins [`ChartOutcome::rect`] so the PNG
+/// export crops around it rather than cutting it off.
+fn relative_axis_note(ui: &mut Ui, t: Theme) -> egui::Rect {
+    let drawn = ui.horizontal_wrapped(|ui| {
+        ui.label(
+            egui::RichText::new("Relative y-axis")
+                .font(adapt::font_micro())
+                .color(c(color::WARNING_600)),
+        );
+        ui.label(
+            egui::RichText::new(
+                "— each trace is scaled to its own range, so heights are not comparable \
+                 between traces. Per-trace ranges are in the channel legend.",
+            )
+            .font(adapt::font_micro())
+            .color(c(t.text_secondary)),
+        );
+    });
+    ui.add_space(spacing::XS);
+    drawn.response.rect
 }
 
 /// Where a plot sits in the stack, and what that implies for its chrome.
@@ -187,48 +243,153 @@ fn data_y_range(channels: &[(usize, &Channel)]) -> (f64, f64) {
     (lo, hi)
 }
 
+/// The unitless axis a per-trace-scaled group is drawn on.
+///
+/// 0..1 rather than 0..100: the tick numbers are all the axis has left, and a
+/// fraction reads as "relative" more plainly than a percentage, which invites the
+/// reader to look for a total.
+const NORM_LO: f64 = 0.0;
+const NORM_HI: f64 = 1.0;
+
+/// Linear remap of one y value from a source range onto a target range.
+///
+/// Deliberately **unclamped**. A value above the user's maximum has to leave the
+/// top of the plot: clipping it to the edge would draw a flat top and imply a
+/// plateau the instrument never measured. A trace that runs off the plot is
+/// obviously cropped; a trace that flattens against the frame is a lie.
+fn remap(value: f64, from: (f64, f64), to: (f64, f64)) -> f64 {
+    let mid = 0.5 * (to.0 + to.1);
+    let span = from.1 - from.0;
+    // A flat trace has no dynamic range to spread over the axis. Mid-height is
+    // the neutral answer; dividing by the zero span gives NaN, and pinning it to
+    // the floor would suggest the signal sat at its minimum.
+    if !value.is_finite() || !span.is_finite() || span == 0.0 {
+        return mid;
+    }
+    let mapped = to.0 + (value - from.0) / span * (to.1 - to.0);
+    // A span too small to divide by (denormal, or a hand-edited sidecar) can
+    // overflow to an infinity that egui_plot would then try to lay out.
+    if mapped.is_finite() {
+        mapped
+    } else {
+        mid
+    }
+}
+
+/// A range usable as a remap source: finite, and strictly increasing.
+fn usable_range(lo: f64, hi: f64) -> Option<(f64, f64)> {
+    (lo.is_finite() && hi.is_finite() && hi > lo).then_some((lo, hi))
+}
+
+/// Where one channel's values are remapped *from*, in display units.
+///
+/// Falls back to the channel's own data range whenever the custom range is
+/// unusable, so a half-typed minimum or a hand-edited sidecar degrades to the
+/// honest default rather than a division by zero. The legend reports the
+/// fallback so the user is not left wondering why their number had no effect.
+fn source_range(channel: &Channel, view: &View) -> Option<(f64, f64)> {
+    let data = channel
+        .display_value_range()
+        .and_then(|(lo, hi)| usable_range(lo as f64, hi as f64));
+    match view.y_scale_mode {
+        YScaleMode::AutoAll | YScaleMode::AutoEach => data,
+        YScaleMode::Custom => view
+            .channel_y_range(&channel.id)
+            .and_then(|(lo, hi)| usable_range(lo as f64, hi as f64))
+            .or(data),
+    }
+}
+
+/// One channel's remap source for this frame. The inner `None` marks a channel
+/// with no usable range of its own — a flat trace, or one with no finite samples.
+type ChannelSource = (ChannelId, Option<(f64, f64)>);
+
+/// The per-channel remap sources for one axis group, or `None` on the shared
+/// scale where there is nothing to remap.
+///
+/// Resolved once per frame and handed to a single [`YMap`], so the traces, their
+/// peak shading, their baselines and the full-height overlays cannot disagree
+/// about where the top of the plot is. Shading that stayed in mAU while its trace
+/// was normalized would simply detach from the curve.
+fn y_sources(channels: &[(usize, &Channel)], view: &View) -> Option<Vec<ChannelSource>> {
+    view.y_scale_mode.is_per_trace().then(|| {
+        channels
+            .iter()
+            .map(|(_, c)| (c.id.clone(), source_range(c, view)))
+            .collect()
+    })
+}
+
 /// Everything a drawing function needs to turn stored data into plot coordinates.
 ///
 /// The two axes are bundled rather than threaded separately because every overlay
 /// needs both, and because they are wanted at different times: the x half is the
-/// unit toggle, the y half is the place the planned per-group y-scaling will
-/// attach. Adding the pair once keeps the six drawing functions' signatures stable
-/// across both features.
+/// unit toggle, the y half is the per-trace y-scaling. Having the pair keeps the
+/// six drawing functions' signatures stable across both features.
 #[derive(Clone, Copy)]
 struct PlotTransform<'a> {
     x: XMap<'a>,
-    y: YMap,
+    y: YMap<'a>,
 }
 
 impl<'a> PlotTransform<'a> {
-    fn new(run: &'a Run, view: &View) -> Self {
+    fn new(run: &'a Run, view: &View, y: YMap<'a>) -> Self {
         Self {
             x: XMap::new(run, view),
-            y: YMap::IDENTITY,
+            y,
         }
     }
 }
 
-/// Placeholder for the per-group y transform.
+/// The per-group y transform: display value → plot y, per channel.
 ///
-/// Today every axis group draws in its own plot at its own natural scale, so
-/// there is nothing to remap and [`YMap::apply`] hands its argument straight
-/// back — deliberately, so current rendering is bit-identical to the code before
-/// the transform existed. The planned multi-y-scale feature (several groups
-/// sharing one plot, each with its own scale) fills this in with the offset and
-/// gain for a group; every call site that will need it already routes through
-/// here.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct YMap;
+/// On the shared scale ([`YScaleMode::AutoAll`]) it holds no sources and
+/// [`YMap::apply`] hands its argument straight back — deliberately, with no
+/// arithmetic at all, so the default rendering is bit-identical to the code
+/// before per-trace scaling existed. In the per-trace modes it borrows the
+/// sources resolved by [`y_sources`] for this frame and remaps each channel onto
+/// the unitless `NORM_LO..NORM_HI` axis.
+///
+/// Borrowed rather than owned so the whole [`PlotTransform`] stays `Copy` and can
+/// keep being passed by value to the six drawing functions.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct YMap<'a> {
+    sources: Option<&'a [ChannelSource]>,
+}
 
-impl YMap {
-    const IDENTITY: YMap = YMap;
+impl<'a> YMap<'a> {
+    /// `None` is the shared scale — the identity. See [`y_sources`], which
+    /// produces `None` for exactly [`YScaleMode::AutoAll`].
+    fn new(sources: Option<&'a [ChannelSource]>) -> Self {
+        Self { sources }
+    }
 
-    /// Display value → plot y. Exactly the identity: no arithmetic, so no
-    /// rounding is introduced on the default path.
+    /// Whether the axis has been stripped of its unit.
     #[inline]
-    fn apply(self, y: f64) -> f64 {
-        y
+    fn is_normalized(self) -> bool {
+        self.sources.is_some()
+    }
+
+    /// Display value → plot y for a given channel.
+    ///
+    /// The shared-scale path returns `y` itself, untouched: no multiply, no add,
+    /// so no rounding is introduced on the overwhelmingly common path.
+    #[inline]
+    fn apply(self, id: &ChannelId, y: f64) -> f64 {
+        let Some(sources) = self.sources else {
+            return y;
+        };
+        match sources
+            .iter()
+            .find(|(cid, _)| cid == id)
+            .and_then(|(_, r)| *r)
+        {
+            Some(from) => remap(y, from, (NORM_LO, NORM_HI)),
+            // No usable source (a flat trace, one with no finite samples, or a
+            // channel hidden this frame that a peak still references): hand a
+            // zero-width range to `remap` and inherit its degenerate rule.
+            None => remap(y, (0.0, 0.0), (NORM_LO, NORM_HI)),
+        }
     }
 
     /// The group's y-extent, given the extent of its data.
@@ -237,11 +398,36 @@ impl YMap {
     /// necessarily produce its axis extent by mapping the data extent — a
     /// normalising one draws on a fixed unitless span regardless of the data.
     /// Overlays are sized from the value this returns, so `data_y_range`'s
-    /// no-feedback guarantee still holds either way.
+    /// no-feedback guarantee still holds either way; in the per-trace modes the
+    /// extent is a compile-time constant, so nothing about the current view can
+    /// enter it at all.
+    ///
+    /// A deliberately clipping custom range does push its trace past the extent,
+    /// and the auto-bounds grow to fit — once. The extent does not follow, so the
+    /// overlays stay strictly inside the bounds they helped produce and the next
+    /// frame computes the same numbers. That is the property that matters: not
+    /// that nothing exceeds the extent, but that the extent never chases what
+    /// does.
     #[inline]
     fn extent(self, data: (f64, f64)) -> (f64, f64) {
-        data
+        match self.sources {
+            None => data,
+            Some(_) => (NORM_LO, NORM_HI),
+        }
     }
+}
+
+/// Drag increment for a custom min/max field, sized to the range being edited.
+///
+/// A fixed step is wrong by orders of magnitude across the units this app shows
+/// at once (mAU in the thousands, pH in single digits), so it is derived from the
+/// span and floored so the field never becomes impossible to nudge.
+fn drag_speed(lo: f64, hi: f64) -> f64 {
+    let span = (hi - lo).abs();
+    if !span.is_finite() || span <= 0.0 {
+        return 0.01;
+    }
+    (span / 200.0).max(1e-4)
 }
 
 /// Translates between stored volume (mL) and the x coordinate on screen.
@@ -531,12 +717,31 @@ fn plot_group(
     // While integrating, dragging draws a selection instead of panning.
     let integrating = view.integrate_mode;
 
-    // Detached before the plot is built so the hover closure borrows nothing the
-    // `show` body below needs mutably.
-    let readout_peaks = hover_peaks(run, &view.peaks, group);
-    let readout_unit = unit.clone();
+    // Resolved before the plot so every drawing helper below reads one mapping.
+    let sources = y_sources(&channels, view);
+    let tf = PlotTransform::new(run, view, YMap::new(sources.as_deref()));
+    let normalized = tf.y.is_normalized();
 
-    let tf = PlotTransform::new(run, view);
+    // Once each trace has its own source range the axis is no longer in `unit`,
+    // so it must not keep saying so — that is the whole correctness argument for
+    // this feature.
+    let axis_label = if normalized {
+        format!("{} (relative)", group.label())
+    } else {
+        format!("{} ({unit})", group.label())
+    };
+
+    // Detached before the plot is built so the hover closure borrows nothing the
+    // `show` body below needs mutably. On a normalized axis the cursor is over a
+    // shared unitless height that several traces reach at several different
+    // numbers, so the readout names no instrument unit either.
+    let readout_peaks = hover_peaks(run, &view.peaks, group);
+    let readout_unit = if normalized {
+        "rel.".to_string()
+    } else {
+        unit.clone()
+    };
+
     let axis = view.x_axis;
     let readout_x = tf.x;
 
@@ -556,7 +761,7 @@ fn plot_group(
         .allow_boxed_zoom(!integrating)
         .show_grid([true, true])
         .custom_y_axes(vec![egui_plot::AxisHints::new_y()
-            .label(format!("{} ({unit})", group.label()))
+            .label(axis_label)
             // Defaults to 20..30 pt, which blanks every tick label on a short
             // plot — unreadable peak heights on the one trace that matters.
             .label_spacing(egui::Rangef::new(12.0, 20.0))
@@ -738,7 +943,7 @@ fn draw_channel(
         .map(|s| {
             [
                 tf.x.sample_x(s),
-                tf.y.apply((s.value * channel.display_scale) as f64),
+                tf.y.apply(&channel.id, (s.value * channel.display_scale) as f64),
             ]
         })
         .collect();
@@ -865,6 +1070,10 @@ fn draw_excluded_regions(
 }
 
 /// Shade each integrated peak between the signal and its baseline.
+///
+/// The shading follows the *drawn* trace through `tf.y`, not the stored values.
+/// The peak's area and height are untouched by any of this: they were computed
+/// in `elusive-core` from the samples and are never re-derived from the picture.
 fn draw_peak_regions(
     plot_ui: &mut egui_plot::PlotUi<'_>,
     view: &View,
@@ -890,7 +1099,7 @@ fn draw_peak_regions(
             .map(|s| {
                 [
                     tf.x.sample_x(s),
-                    tf.y.apply((s.value * channel.display_scale) as f64),
+                    tf.y.apply(&channel.id, (s.value * channel.display_scale) as f64),
                 ]
             })
             .collect();
@@ -932,11 +1141,17 @@ fn draw_peak_regions(
     }
 }
 
-/// The two endpoints of the peak's baseline, in display units.
+/// The two endpoints of the peak's baseline, in plot coordinates.
 ///
 /// `x_start`/`x_end` are the window's edges already mapped onto the current axis;
 /// the baseline *values* are still worked out in volume, because that is the
 /// geometry the integration used and it must not change with the view.
+///
+/// Every y goes through `tf.y` for the same reason the trace does: an unmapped
+/// baseline would sit somewhere else entirely and the shaded region would stop
+/// touching the curve it belongs to. The valley interpolation is unaffected by
+/// the ordering — the remap is affine, so interpolating before or after it gives
+/// the same line.
 fn baseline_points(
     peak: &elusive_core::model::PeakResult,
     channel: &Channel,
@@ -946,18 +1161,27 @@ fn baseline_points(
     x_end: f64,
 ) -> Vec<[f64; 2]> {
     use elusive_core::model::BaselineMode;
-    let scale = channel.display_scale as f64;
-    let at = |v: f32| channel.value_at_volume(v).map(|y| y as f64 * scale);
+    let display_scale = channel.display_scale as f64;
+    let at = |v: f32| {
+        channel
+            .value_at_volume(v)
+            .map(|y| tf.y.apply(&channel.id, y as f64 * display_scale))
+    };
+    // Where a displayed zero lands on this axis. On the shared scale that is
+    // plain 0.0, which is what this code assumed outright before per-trace
+    // scaling existed — but `y_lo` is in *plot* coordinates, so on a normalized
+    // axis comparing it against an unmapped 0.0 would mix two units.
+    let zero = tf.y.apply(&channel.id, 0.0);
 
     let (y0, y1) = match peak.baseline {
-        BaselineMode::DropToZero => (0.0f64.max(y_lo), 0.0f64.max(y_lo)),
+        BaselineMode::DropToZero => (zero.max(y_lo), zero.max(y_lo)),
         BaselineMode::LinearEndpoints => (
-            at(peak.v_start_ml).unwrap_or(0.0),
-            at(peak.v_end_ml).unwrap_or(0.0),
+            at(peak.v_start_ml).unwrap_or(zero),
+            at(peak.v_end_ml).unwrap_or(zero),
         ),
         BaselineMode::ValleyToValley { left_ml, right_ml } => {
             // Extend the valley line out to the peak's own window.
-            let (ya, yb) = (at(left_ml).unwrap_or(0.0), at(right_ml).unwrap_or(0.0));
+            let (ya, yb) = (at(left_ml).unwrap_or(zero), at(right_ml).unwrap_or(zero));
             let span = (right_ml - left_ml) as f64;
             let interp = |v: f32| {
                 if span.abs() < f64::EPSILON {
@@ -970,7 +1194,7 @@ fn baseline_points(
         }
     };
 
-    vec![[x_start, tf.y.apply(y0)], [x_end, tf.y.apply(y1)]]
+    vec![[x_start, y0], [x_end, y1]]
 }
 
 /// Width of the legend swatch. The dash patterns below are laid out against it,
@@ -1003,9 +1227,132 @@ fn paint_swatch(painter: &egui::Painter, rect: egui::Rect, rgb: Rgb, dash: chart
     }
 }
 
+/// The y-scale mode selector.
+///
+/// It sits with the legend rather than in the toolbar because the per-channel
+/// min/max fields it governs are here; splitting a control from the fields it
+/// enables makes the relationship guesswork.
+fn y_scale_controls(ui: &mut Ui, view: &mut View, t: Theme) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label(
+            egui::RichText::new("Y scale")
+                .font(adapt::font_micro())
+                .color(c(t.text_secondary)),
+        );
+        for mode in YScaleMode::ALL {
+            let selected = view.y_scale_mode == mode;
+            if ui.selectable_label(selected, mode.label()).clicked() {
+                view.set_y_scale_mode(mode);
+            }
+        }
+    });
+}
+
+/// One channel's y range: read-only in `AutoEach`, editable in `Custom`.
+///
+/// Values are in display units — the same numbers the axis and the hover readout
+/// use — so a user typing "500" for a UV channel means 500 mAU, not 500 AU.
+fn channel_range_row(ui: &mut Ui, channel: &Channel, view: &mut View, t: Theme) {
+    let data = channel.display_value_range();
+    let effective = source_range(channel, view);
+    let mode = view.y_scale_mode;
+
+    ui.horizontal_wrapped(|ui| {
+        // Indent past the checkbox and swatch so the numbers line up under the name.
+        ui.add_space(spacing::XXL);
+
+        match mode {
+            // Never reached: the caller only draws this row in a per-trace mode.
+            YScaleMode::AutoAll => {}
+            YScaleMode::AutoEach => {
+                let (lo, hi) = effective.unwrap_or((0.0, 0.0));
+                ui.label(
+                    egui::RichText::new("min")
+                        .font(adapt::font_micro())
+                        .color(c(t.text_secondary)),
+                );
+                ui.label(
+                    egui::RichText::new(adapt::num(lo, 3))
+                        .font(adapt::font_code())
+                        .color(c(t.text_primary)),
+                );
+                ui.label(
+                    egui::RichText::new("max")
+                        .font(adapt::font_micro())
+                        .color(c(t.text_secondary)),
+                );
+                ui.label(
+                    egui::RichText::new(adapt::num(hi, 3))
+                        .font(adapt::font_code())
+                        .color(c(t.text_primary)),
+                );
+                ui.label(
+                    egui::RichText::new(&channel.display_unit)
+                        .font(adapt::font_micro())
+                        .color(c(t.text_secondary)),
+                );
+            }
+            YScaleMode::Custom => {
+                let fallback = data.unwrap_or((0.0, 1.0));
+                let (mut lo, mut hi) = view.channel_y_range(&channel.id).unwrap_or(fallback);
+                let speed = drag_speed(lo as f64, hi as f64) as f32;
+
+                ui.label(
+                    egui::RichText::new("min")
+                        .font(adapt::font_micro())
+                        .color(c(t.text_secondary)),
+                );
+                let mut changed = ui
+                    .add(egui::DragValue::new(&mut lo).speed(speed).max_decimals(4))
+                    .changed();
+                ui.label(
+                    egui::RichText::new("max")
+                        .font(adapt::font_micro())
+                        .color(c(t.text_secondary)),
+                );
+                changed |= ui
+                    .add(egui::DragValue::new(&mut hi).speed(speed).max_decimals(4))
+                    .changed();
+                ui.label(
+                    egui::RichText::new(&channel.display_unit)
+                        .font(adapt::font_micro())
+                        .color(c(t.text_secondary)),
+                );
+                if changed {
+                    view.set_channel_y_range(&channel.id, lo, hi);
+                }
+                if ui.small_button("Reset").clicked() {
+                    view.clear_channel_y_range(&channel.id);
+                }
+            }
+        }
+    });
+
+    // §6: a validation message states the problem *and* the corrective action.
+    if mode == YScaleMode::Custom {
+        if let Some((lo, hi)) = view.channel_y_range(&channel.id) {
+            if usable_range(lo as f64, hi as f64).is_none() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.add_space(spacing::XXL);
+                    ui.label(
+                        egui::RichText::new(
+                            "Min must be below max — drawing this trace at its data range instead.",
+                        )
+                        .font(adapt::font_micro())
+                        .color(c(color::WARNING_600)),
+                    );
+                });
+            }
+        }
+    }
+}
+
 /// Legend with per-channel visibility, colour swatch, and unit — the control
-/// surface for Phase 2's show/hide requirement.
+/// surface for Phase 2's show/hide requirement, and for the y-scale mode.
 pub fn legend(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) {
+    y_scale_controls(ui, view, t);
+    ui.add_space(spacing::XS);
+
     egui::ScrollArea::vertical()
         .id_salt("channel-legend")
         .show(ui, |ui| {
@@ -1014,6 +1361,7 @@ pub fn legend(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) {
                     continue;
                 }
                 let mut visible = view.is_channel_visible(&channel.id);
+                let scaled = visible && view.y_scale_mode.is_per_trace();
                 ui.horizontal(|ui| {
                     if ui.checkbox(&mut visible, "").changed() {
                         view.set_channel_visible(&channel.id, visible);
@@ -1065,6 +1413,20 @@ pub fn legend(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) {
                         view.focus_channel(&channel.id);
                     }
 
+                    // A word, not a tint: whoever reads this has to be told the
+                    // trace's height is no longer on the group's scale (rule #3).
+                    if scaled {
+                        ui.label(
+                            egui::RichText::new("scaled")
+                                .font(adapt::font_micro())
+                                .color(c(color::WARNING_600)),
+                        )
+                        .on_hover_text(
+                            "This trace is drawn on its own range, so its height cannot be \
+                             compared with the others",
+                        );
+                    }
+
                     ui.label(
                         egui::RichText::new(format!(
                             "{} · {} pts",
@@ -1075,6 +1437,10 @@ pub fn legend(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) {
                         .color(c(t.text_secondary)),
                     );
                 });
+
+                if scaled {
+                    channel_range_row(ui, channel, view, t);
+                }
             }
         });
 }
@@ -1651,35 +2017,420 @@ mod tests {
 
     // --- y transform ------------------------------------------------------
 
+    /// A channel whose displayed values run 0..`peak_display`, in `n` samples.
+    fn ramp(id: &str, peak_display: f32, display_scale: f32, n: usize) -> Channel {
+        let mut ch = Channel::new(id, id, ChannelKind::Uv);
+        ch.display_scale = display_scale;
+        ch.display_unit = "mAU".into();
+        ch.samples = (0..n)
+            .map(|i| {
+                let t = i as f32 / (n - 1) as f32;
+                Sample::new(t * 60.0, t * 2.0, t * peak_display / display_scale)
+            })
+            .collect();
+        ch
+    }
+
+    fn view_in(mode: YScaleMode) -> View {
+        let mut view = View::default();
+        view.set_y_scale_mode(mode);
+        view
+    }
+
+    /// The y half of the transform for one group, with the sources it borrows.
+    ///
+    /// The `Vec` has to outlive the [`YMap`] that points into it, so it is handed
+    /// back alongside rather than dropped at the end of a helper.
+    fn scale_for<'a>(
+        channels: &[(usize, &Channel)],
+        view: &View,
+        keep: &'a mut Option<Vec<ChannelSource>>,
+    ) -> YMap<'a> {
+        *keep = y_sources(channels, view);
+        YMap::new(keep.as_deref())
+    }
+
+    /// A `PlotTransform` around a bare y map, for the drawing helpers that take
+    /// the whole pair. The x half is unused by everything tested here.
+    fn tf_with(y: YMap<'_>) -> PlotTransform<'_> {
+        PlotTransform {
+            x: XMap {
+                axis: XAxis::Volume,
+                reference: None,
+            },
+            y,
+        }
+    }
+
     #[test]
-    fn the_y_map_is_exactly_the_identity_for_now() {
-        // Exact equality, not an epsilon: the placeholder must introduce no
-        // arithmetic at all, so today's rendering is bit-identical to the code
-        // before `PlotTransform` existed. `feat/multi-y-scales` replaces the body
-        // of `YMap::apply`; when it does, this test is the one to rewrite.
-        for y in [
+    fn the_shared_scale_draws_every_value_exactly_as_it_stands() {
+        // Exact equality, not an epsilon: `AutoAll` must be bit-identical to the
+        // pre-feature rendering path, so the mapping is required to be the
+        // literal identity — no arithmetic at all, and no rounding introduced.
+        let uv = ramp("MWave2", 500.0, 1000.0, 5);
+        let channels = vec![(0usize, &uv)];
+        let mut keep = None;
+        let y = scale_for(&channels, &view_in(YScaleMode::AutoAll), &mut keep);
+
+        assert!(!y.is_normalized());
+        assert_eq!(y, YMap::new(None), "the shared scale resolves no sources");
+        for v in [
             0.0f64,
             -0.0,
             1.0,
             -412.6,
+            123.456,
             f64::MIN_POSITIVE,
             f64::MAX,
             0.1 + 0.2,
+            1e9,
         ] {
             assert!(
-                YMap::IDENTITY.apply(y) == y,
-                "y = {y} came back as {}",
-                YMap::IDENTITY.apply(y)
+                y.apply(&uv.id, v) == v,
+                "v = {v} came back as {}",
+                y.apply(&uv.id, v)
             );
         }
-        assert!(YMap::IDENTITY.apply(f64::NAN).is_nan());
+        assert!(y.apply(&uv.id, f64::NAN).is_nan());
 
         // The extent hook is likewise exactly pass-through, so overlays are still
         // sized from `data_y_range` and nothing re-enters the plot's auto-bounds.
-        let data = data_y_range(&[]);
-        assert!(YMap::IDENTITY.extent(data) == data);
-        assert!(YMap::IDENTITY.extent((-412.6, 1e300)) == (-412.6, 1e300));
+        let data = data_y_range(&channels);
+        assert!(y.extent(data) == data);
+        assert!(y.extent((-412.6, 1e300)) == (-412.6, 1e300));
+    }
 
-        assert_eq!(PlotTransform::new(&mapping_run(), &View::default()).y, YMap);
+    #[test]
+    fn remap_is_the_identity_when_the_ranges_match() {
+        for v in [-3.0, 0.0, 0.5, 17.25, 1e6] {
+            assert_eq!(remap(v, (0.0, 100.0), (0.0, 100.0)), v);
+        }
+    }
+
+    #[test]
+    fn remap_puts_the_midpoint_at_the_midpoint() {
+        assert!((remap(1020.0, (20.0, 2020.0), (0.0, 1.0)) - 0.5).abs() < 1e-12);
+        // Also with a target that does not start at zero, and an offset source.
+        assert!((remap(6.0, (4.0, 8.0), (10.0, 30.0)) - 20.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn remap_does_not_clamp_values_outside_the_source_range() {
+        // A clipped trace has to visibly leave the plot. Flattening it against
+        // the frame would draw a plateau the instrument never measured.
+        assert!(remap(150.0, (0.0, 100.0), (0.0, 1.0)) > 1.0);
+        assert!(remap(-50.0, (0.0, 100.0), (0.0, 1.0)) < 0.0);
+    }
+
+    #[test]
+    fn a_degenerate_source_range_maps_to_mid_height_not_nan() {
+        // A flat trace: every sample is the same number, so there is no dynamic
+        // range to spread over the axis.
+        let y = remap(5.0, (5.0, 5.0), (0.0, 1.0));
+        assert!(y.is_finite(), "y = {y}");
+        assert!((y - 0.5).abs() < 1e-12, "y = {y}");
+    }
+
+    #[test]
+    fn remap_survives_inputs_no_division_can_cope_with() {
+        // A span too small to divide by, and a non-finite value: both would
+        // otherwise reach egui_plot as NaN or an infinity to lay out.
+        assert!(remap(1.0, (0.0, f64::MIN_POSITIVE / 4.0), (0.0, 1.0)).is_finite());
+        assert!(remap(f64::NAN, (0.0, 1.0), (0.0, 1.0)).is_finite());
+        assert!(remap(1.0, (0.0, f64::NAN), (0.0, 1.0)).is_finite());
+        assert!(remap(f64::INFINITY, (0.0, 1.0), (0.0, 1.0)).is_finite());
+    }
+
+    #[test]
+    fn overlay_extent_is_the_relative_axis_when_traces_are_scaled() {
+        // The counterpart to `overlay_extent_comes_from_the_data_not_the_view`:
+        // in a per-trace mode the extent is a compile-time constant, which is
+        // stability by construction — nothing about the current bounds, the
+        // current data or the current window can enter it.
+        let big = ramp("MWave2", 2000.0, 1000.0, 9);
+        let small = ramp("MWave1", 40.0, 1000.0, 9);
+        let channels = vec![(0usize, &big), (1usize, &small)];
+
+        for mode in [YScaleMode::AutoEach, YScaleMode::Custom] {
+            let mut keep = None;
+            let y = scale_for(&channels, &view_in(mode), &mut keep);
+            assert!(y.is_normalized());
+            assert_eq!(y.extent(data_y_range(&channels)), (NORM_LO, NORM_HI));
+            // Even a wildly wrong "data" extent cannot move it.
+            assert_eq!(y.extent((-1e300, 1e300)), (NORM_LO, NORM_HI), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn the_extent_never_chases_a_trace_that_leaves_the_plot() {
+        // A clipping custom range *does* push its trace past the extent, and the
+        // auto-bounds grow once to fit. The bug this guards against is the
+        // extent then following: the overlays would re-enter the next frame's
+        // bounds and inflate them again, every repaint, forever.
+        let uv = ramp("MWave2", 500.0, 1000.0, 9);
+        let channels = vec![(0usize, &uv)];
+        let mut view = view_in(YScaleMode::Custom);
+        view.set_channel_y_range(&uv.id, 0.0, 100.0);
+
+        let mut keep = None;
+        let first = scale_for(&channels, &view, &mut keep);
+        let first_extent = first.extent(data_y_range(&channels));
+        assert!(first.apply(&uv.id, 500.0) > first_extent.1);
+
+        // Re-resolving with the same inputs — i.e. the next frame — must not
+        // have moved.
+        let mut keep2 = None;
+        let second = scale_for(&channels, &view, &mut keep2);
+        assert_eq!(first_extent, second.extent(data_y_range(&channels)));
+        assert_eq!(first_extent, (NORM_LO, NORM_HI));
+    }
+
+    #[test]
+    fn overlay_extent_encloses_the_traces_on_the_ranges_it_derives_itself() {
+        // Whenever the scale picks the range (both auto modes, and custom before
+        // the user narrows anything), every point the traces contribute to
+        // auto-bounds lies inside the extent the overlays are drawn from.
+        let big = ramp("MWave2", 2000.0, 1000.0, 9);
+        let small = ramp("MWave1", 40.0, 1000.0, 9);
+        let channels = vec![(0usize, &big), (1usize, &small)];
+
+        for mode in YScaleMode::ALL {
+            let mut keep = None;
+            let y = scale_for(&channels, &view_in(mode), &mut keep);
+            let (lo, hi) = y.extent(data_y_range(&channels));
+            for (_, channel) in &channels {
+                for s in &channel.samples {
+                    let mapped = y.apply(&channel.id, (s.value * channel.display_scale) as f64);
+                    assert!(
+                        mapped >= lo - 1e-9 && mapped <= hi + 1e-9,
+                        "mode={mode:?} y={mapped}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn auto_each_makes_a_small_trace_fill_the_plot() {
+        // The whole point of the feature: 40 mAU beside 2000 mAU is a flat line
+        // on a shared axis, and a full-height curve on its own.
+        let big = ramp("MWave2", 2000.0, 1000.0, 9);
+        let small = ramp("MWave1", 40.0, 1000.0, 9);
+        let channels = vec![(0usize, &big), (1usize, &small)];
+
+        let mut keep = None;
+        let shared = scale_for(&channels, &view_in(YScaleMode::AutoAll), &mut keep);
+        let shared_extent = shared.extent(data_y_range(&channels));
+        let small_top_shared = shared.apply(&small.id, 40.0);
+        assert!(
+            small_top_shared / shared_extent.1 < 0.05,
+            "the premise of the feature: {small_top_shared}"
+        );
+
+        let mut keep2 = None;
+        let each = scale_for(&channels, &view_in(YScaleMode::AutoEach), &mut keep2);
+        assert!((each.apply(&small.id, 40.0) - NORM_HI).abs() < 1e-9);
+        assert!((each.apply(&big.id, 2000.0) - NORM_HI).abs() < 1e-9);
+        assert!((each.apply(&small.id, 0.0) - NORM_LO).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_custom_range_overrides_the_data_range() {
+        let uv = ramp("MWave2", 500.0, 1000.0, 5);
+        let channels = vec![(0usize, &uv)];
+        let mut view = view_in(YScaleMode::Custom);
+        view.set_channel_y_range(&uv.id, 0.0, 1000.0);
+
+        let mut keep = None;
+        let y = scale_for(&channels, &view, &mut keep);
+        // Half the user's window, so half the plot height — not full height.
+        assert!((y.apply(&uv.id, 500.0) - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_custom_range_below_the_data_lets_the_trace_leave_the_plot() {
+        let uv = ramp("MWave2", 500.0, 1000.0, 5);
+        let channels = vec![(0usize, &uv)];
+        let mut view = view_in(YScaleMode::Custom);
+        view.set_channel_y_range(&uv.id, 0.0, 100.0);
+
+        let mut keep = None;
+        let y = scale_for(&channels, &view, &mut keep);
+        assert!(
+            y.apply(&uv.id, 500.0) > NORM_HI,
+            "a clipped peak must run off the top, not flatten against it"
+        );
+    }
+
+    #[test]
+    fn an_unusable_custom_range_falls_back_to_the_data_range() {
+        let uv = ramp("MWave2", 500.0, 1000.0, 5);
+        let channels = vec![(0usize, &uv)];
+
+        for (lo, hi) in [(500.0f32, 0.0f32), (7.0, 7.0)] {
+            let mut view = view_in(YScaleMode::Custom);
+            view.set_channel_y_range(&uv.id, lo, hi);
+            let mut keep = None;
+            let y = scale_for(&channels, &view, &mut keep);
+            // Same as `AutoEach` would give: the data range, full height.
+            assert!(
+                (y.apply(&uv.id, 500.0) - NORM_HI).abs() < 1e-9,
+                "({lo}, {hi}) should have fallen back to the data range"
+            );
+        }
+    }
+
+    #[test]
+    fn a_channel_the_scale_has_never_heard_of_still_draws_finitely() {
+        // Defensive: a peak can reference a channel that is hidden this frame.
+        let uv = ramp("MWave2", 500.0, 1000.0, 5);
+        let channels = vec![(0usize, &uv)];
+        let mut keep = None;
+        let y = scale_for(&channels, &view_in(YScaleMode::AutoEach), &mut keep);
+        assert!(y.apply(&ChannelId::from("NoSuchChannel"), 42.0).is_finite());
+    }
+
+    #[test]
+    fn a_flat_trace_sits_mid_plot_rather_than_producing_nan() {
+        let mut flat = Channel::new("MWave3", "UV 214 nm", ChannelKind::Uv);
+        flat.display_scale = 1000.0;
+        flat.samples = vec![Sample::new(0.0, 0.0, 0.3), Sample::new(60.0, 2.0, 0.3)];
+        let channels = vec![(0usize, &flat)];
+
+        let mut keep = None;
+        let y = scale_for(&channels, &view_in(YScaleMode::AutoEach), &mut keep);
+        let mapped = y.apply(&flat.id, 300.0);
+        assert!(
+            mapped.is_finite() && (mapped - 0.5).abs() < 1e-12,
+            "y = {mapped}"
+        );
+    }
+
+    #[test]
+    fn peak_shading_stays_attached_to_the_trace_it_belongs_to() {
+        let uv = ramp("MWave2", 500.0, 1000.0, 9);
+        let channels = vec![(0usize, &uv)];
+        let peak = PeakResult {
+            id: PeakId(1),
+            channel_id: uv.id.clone(),
+            v_start_ml: 0.5,
+            v_end_ml: 1.5,
+            baseline: BaselineMode::LinearEndpoints,
+            area: 0.0,
+            height: 0.0,
+            apex_volume_ml: 1.0,
+            fwhm_ml: None,
+            estimated_mw_kda: None,
+        };
+
+        for mode in YScaleMode::ALL {
+            let mut keep = None;
+            let y = scale_for(&channels, &view_in(mode), &mut keep);
+            let (lo, _) = y.extent(data_y_range(&channels));
+            let pts = baseline_points(
+                &peak,
+                &uv,
+                tf_with(y),
+                lo,
+                peak.v_start_ml as f64,
+                peak.v_end_ml as f64,
+            );
+            for (i, v) in [(0usize, peak.v_start_ml), (1, peak.v_end_ml)] {
+                // The baseline endpoint must land exactly where the drawn trace
+                // is at that volume, or the shaded region detaches from it.
+                let on_trace = y.apply(
+                    &uv.id,
+                    (uv.value_at_volume(v).expect("sampled volume") * uv.display_scale) as f64,
+                );
+                assert!(
+                    (pts[i][1] - on_trace).abs() < 1e-9,
+                    "mode={mode:?} baseline={} trace={on_trace}",
+                    pts[i][1]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_drop_to_zero_baseline_follows_the_scale_too() {
+        let mut uv = ramp("MWave2", 500.0, 1000.0, 9);
+        // Shift the trace up so a displayed zero is genuinely below its data range.
+        for s in &mut uv.samples {
+            s.value += 0.1;
+        }
+        let channels = vec![(0usize, &uv)];
+        let peak = PeakResult {
+            id: PeakId(1),
+            channel_id: uv.id.clone(),
+            v_start_ml: 0.5,
+            v_end_ml: 1.5,
+            baseline: BaselineMode::DropToZero,
+            area: 0.0,
+            height: 0.0,
+            apex_volume_ml: 1.0,
+            fwhm_ml: None,
+            estimated_mw_kda: None,
+        };
+
+        let mut keep = None;
+        let y = scale_for(&channels, &view_in(YScaleMode::AutoEach), &mut keep);
+        let (lo, _) = y.extent(data_y_range(&channels));
+        let pts = baseline_points(
+            &peak,
+            &uv,
+            tf_with(y),
+            lo,
+            peak.v_start_ml as f64,
+            peak.v_end_ml as f64,
+        );
+        // Zero is below the trace's own minimum, so it clamps to the plot floor
+        // exactly as the shared-scale path already did.
+        assert!((pts[0][1] - NORM_LO).abs() < 1e-12, "y = {}", pts[0][1]);
+        assert_eq!(pts[0][1], pts[1][1]);
+    }
+
+    #[test]
+    fn drag_speed_tracks_the_magnitude_of_the_range_being_edited() {
+        // A step that suits mAU in the thousands is useless for pH.
+        assert!(drag_speed(0.0, 2000.0) > drag_speed(6.0, 8.0));
+        // Never zero, or the field cannot be nudged at all.
+        for (lo, hi) in [(0.0, 0.0), (1.0, f64::NAN), (5.0, 5.0)] {
+            assert!(drag_speed(lo, hi) > 0.0);
+        }
+    }
+
+    #[test]
+    fn usable_range_refuses_everything_the_remap_cannot_divide_by() {
+        assert_eq!(usable_range(0.0, 1.0), Some((0.0, 1.0)));
+        assert_eq!(usable_range(1.0, 0.0), None);
+        assert_eq!(usable_range(1.0, 1.0), None);
+        assert_eq!(usable_range(f64::NAN, 1.0), None);
+        assert_eq!(usable_range(0.0, f64::INFINITY), None);
+    }
+
+    #[test]
+    fn a_normalized_axis_stops_claiming_the_instrument_s_unit() {
+        // The honesty rule, checked on the two strings the user actually reads:
+        // the axis title and the hover readout. `mAU` must not survive either.
+        let uv = ramp("MWave2", 500.0, 1000.0, 5);
+        let channels = vec![(0usize, &uv)];
+
+        let mut shared_keep = None;
+        let shared = scale_for(&channels, &view_in(YScaleMode::AutoAll), &mut shared_keep);
+        assert!(!shared.is_normalized());
+
+        let mut keep = None;
+        let y = scale_for(&channels, &view_in(YScaleMode::AutoEach), &mut keep);
+        assert!(y.is_normalized());
+
+        // Same shape as `plot_group` builds them.
+        let label = format!("{} (relative)", AxisGroup::Uv.label());
+        assert!(!label.contains("mAU"), "{label}");
+        assert!(label.ends_with("(relative)"), "{label}");
+
+        let run = hover_run();
+        let readout = hover_label(&run, &[], "rel.", XAxis::Volume, 4.0, 0.5, None);
+        assert_eq!(readout, "4.000 mL\n0.500 rel.");
+        assert!(!readout.contains("mAU"));
     }
 }

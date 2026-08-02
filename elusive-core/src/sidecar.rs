@@ -19,7 +19,8 @@
 //!                       "intercept": 3.0, "r_squared": 0.999, "points": [] } ],
 //!   "annotations": [ { "volume_ml": 13.0, "text": "monomer" } ],
 //!   "view": { "visible_channels": ["MWave2"], "dark_mode": true,
-//!             "plate_channel": "MWave2", "plate_metric": "IntegratedArea" }
+//!             "plate_channel": "MWave2", "plate_metric": "IntegratedArea",
+//!             "y_scale_mode": "custom", "channel_y_ranges": { "MWave2": [0.0, 500.0] } }
 //! }
 //! ```
 //!
@@ -114,6 +115,23 @@ pub struct ViewState {
     /// older or newer build without failing the whole sidecar.
     #[serde(default)]
     pub x_axis: Option<String>,
+    /// How the chromatogram scales its y-axes, as the app's stable key
+    /// (`auto-all`, `auto-each`, `custom`).
+    ///
+    /// A string rather than an enum on purpose: which y-scale modes exist is a
+    /// property of the viewer, not of the run, and `elusive-core` has no use for
+    /// the distinction. Keeping it opaque here means the UI can add a mode
+    /// without a core release, and an older build reading a newer sidecar can
+    /// report the unknown key instead of failing to deserialise the file.
+    #[serde(default)]
+    pub y_scale_mode: Option<String>,
+    /// Per-channel y range in *display* units, keyed by channel id. Only
+    /// meaningful in the `custom` mode.
+    ///
+    /// `Option` for the same reason as `channel_colors`: "this build never had
+    /// the feature" and "the user cleared every range" are different facts.
+    #[serde(default)]
+    pub channel_y_ranges: Option<BTreeMap<String, (f32, f32)>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -527,6 +545,25 @@ mod tests {
         let s = from_json(json).unwrap();
         assert_eq!(s.view.visible_channels, vec!["MWave2".to_string()]);
         assert!(s.view.overview_order.is_none());
+    }
+
+    #[test]
+    fn y_scale_state_survives_a_round_trip_and_is_optional_on_the_wire() {
+        let mut s = Sidecar::default();
+        s.view.y_scale_mode = Some("custom".into());
+        s.view.channel_y_ranges =
+            Some(BTreeMap::from([("MWave2".to_string(), (0.0f32, 500.0f32))]));
+        let back = from_json(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.view.y_scale_mode, s.view.y_scale_mode);
+        assert_eq!(back.view.channel_y_ranges, s.view.channel_y_ranges);
+
+        // Absent in everything written before the feature existed; the core must
+        // read those files unchanged rather than refusing them.
+        let legacy = r#"{"version": 1, "source": {"file_name":"run.ngcAnalysis","run_name":"r"},
+            "view": {"visible_channels":["MWave2"]}}"#;
+        let old = from_json(legacy).expect("a pre-y-scale sidecar should still parse");
+        assert_eq!(old.view.y_scale_mode, None);
+        assert_eq!(old.view.channel_y_ranges, None);
     }
 
     #[test]
