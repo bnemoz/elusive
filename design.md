@@ -66,16 +66,35 @@ Superdex SEC run, ChromLab export):
 
 ```
 Version.txt                              (methodruns only)
-Method/MethodData.xml, MethodInfo.xml    method definition + info
-Runs/Run1.xml, RunInfo1.xml              run identity + metadata
+Methods/MethodData1.xml                  method definition (incl. Wavelength1..4, ColumnType)
+Methods/MethodInfo1.xml                  method info
+Runs/Run1.xml                            run identity
+Runs/RunInfo1.xml                        run metadata
+Runs/AnalysisRunViewSettings1.xml        ChromLab's saved view state
 Runs/Run1/Trace_<Name>_<idx>.xml         one XML per channel/trace (see below)
-Analysis.xml                             (analysis export only) integration/analysis state
+Analysis.xml                             (analysis export only) ChromLab's own peak results
 ```
+
+*Corrected 2026-08-02 against a real archive.* The earlier listing said
+`Method/MethodData.xml` — the directory is **plural** and the files are
+**numbered**, and `AnalysisRunViewSettings1.xml` was missing entirely.
 
 Trace file names seen: `MWave0..3` (the four UV wavelengths), `MD_Conductivity`,
 `PercentB`, `ModulePH`, `MD_Temperature`, `FlowRate`, `SamplePumpFlowRate`,
 several pressure channels, `Fractions` (x2), `NextGenEvents` (logbook),
 `Annotations`.
+
+The trailing `_<idx>` in a trace file name is **not** the wavelength index and
+carries no meaning worth relying on: this run has `Trace_MWave0_8.xml`,
+`Trace_MWave1_2.xml`, `Trace_MWave2_14.xml`, `Trace_MWave3_4.xml`.
+
+`Analysis.xml` was previously described only as "integration/analysis state". It
+is the largest entry (6.1 MB here) and holds ChromLab's **own 58 peak records** —
+area, height, FWHM, baseline endpoints, asymmetry, path length — grouped into
+`<AlgorithmParameters>` blocks whose `<RunDataId>` matches a trace's
+`<OriginalRunDataId>`. Every value has a `Raw` twin, which is *not* a unit
+conversion but a decimated-versus-full-rate pair (index 5 vs 84, 23 vs 376, a
+consistent ~16×). See `docs/format-findings.md`.
 
 ### 3.1 Signal traces (MWave*, Conductivity, pH, pressures, …)
 
@@ -347,16 +366,46 @@ fractions, and the 96-well plate — which the generic mockup does not show.
 
 ## 15. Open questions / verification checklist
 
-- [ ] `MWave0..3` → wavelength mapping (read from method XML, don't assume order).
-- [ ] UV value scale: AU vs mAU (×1000?) — confirm per channel from units.
-- [ ] Reconcile the two `Trace_Fractions_*` files (full stream vs summary).
-- [ ] Confirm V0/Vt availability for Kav-based SEC calibration; else fall back to
-      volume-based fit.
-- [ ] Path length + ε source for concentration (method file? manual entry?).
+All six format questions were **answered** against a real export on 2026-08-02;
+the evidence is in `docs/format-findings.md` and the assertions in
+`elusive-core/tests/real_archive.rs`. A box is ticked only when the *parser*
+does the right thing, not merely when the format is understood — four are
+answered but not yet implemented, and each carries an `#[ignore]`d test naming
+the fix. Run `cargo test -p elusive-core --test real_archive -- --ignored`.
+
+- [ ] `MWave0..3` → wavelength mapping. **Answered:** `Methods/MethodData1.xml`
+      declares `<Wavelength1..4>` = 215/255/280/495, numbered from 1 while traces
+      number from 0, so `Wavelength1` belongs to `MWave0`. **Not implemented:**
+      the parser never finds them and falls back to positional order, which is
+      right for this run only by coincidence.
+- [ ] UV value scale: AU vs mAU. **Answered:** stored in **AU**, displayed as
+      **mAU** (×1000). Confirmed twice over — the raw payload peaks at 0.22661
+      and ChromLab's own stored `Height` is 0.227303, the difference being a
+      −0.0152 AU baseline. **Not implemented as a convention:** an NGC trace
+      header declares no unit at all, so `display_scale_for` only ever reaches
+      its magnitude heuristic; it is correct here by luck.
+- [x] Reconcile the two `Trace_Fractions_*` files. **Answered:** it is not
+      "full stream vs summary" — `Trace_Fractions_19.xml` is an empty
+      `<Node />`. Prefer the populated entry; all 75 fractions carry a measured
+      `FractionDone`, so no boundary is inferred. Behaviour verified; one
+      cosmetic gap remains (the empty companion is reported as malformed).
+- [x] V0/Vt for Kav-based SEC calibration. **Answered: absent.** No `Void`,
+      `V0`, `Vt`, `BedVolume` or `TotalVolume` anywhere in the method, so the
+      volume-based fit is correct and stays. `<ColumnType>Superdex 200 10/300
+      GL</ColumnType>` *is* recorded and is not yet read into `RunMeta.column`.
+- [ ] Path length + ε for concentration. **Answered:** `Analysis.xml` records
+      `<PathLength>0.5</PathLength>` on all 58 peaks, and
+      `<ExtinctionCoefficient xsi:nil="true"/>` on all of them — so ε is
+      genuinely absent and stays a manual input. **Not implemented:** nothing
+      reads the path length, so the UI uses a 0.2 cm default that is wrong for
+      this instrument by 2.5×, directly into the concentration estimate.
 - [x] Plate heatmap colormap + colorblind option — resolved in DESIGN_SYSTEM.md §10.3.
 - [x] Channel overflow beyond 8 series — resolved in DESIGN_SYSTEM.md §10.4.
-- [ ] Confirm `HEP96` geometry (8×12) and whether other rack types appear in your
-      workflows (add to `wells` as needed).
+- [x] `HEP96` geometry (8×12). **Answered and verified:** all 150 fraction
+      records declare `RackType=HEP96`, `CollectionPattern=Serpentine`,
+      `FractionCollectorType=Hawkeye`, 0.4 mL fractions, tubes 1–75, and every
+      tube resolves to a well (A1…A12, then B12…B1). Whether *other* rack types
+      appear in practice is a question about lab workflow, not about the format.
 
 ---
 
