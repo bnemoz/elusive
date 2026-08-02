@@ -32,6 +32,12 @@ pub struct ChartOutcome {
     pub interaction: Option<Interaction>,
     /// Elution volume under the pointer, when it is over one of the plots.
     pub hovered_volume: Option<f32>,
+    /// Screen rect the stacked plots occupy, in logical points.
+    ///
+    /// Reported for the same reason as everything else here: the pane does not
+    /// know that anyone wants to photograph it. `app` uses this to crop a
+    /// framebuffer capture down to the chart. `None` when nothing was drawn.
+    pub rect: Option<egui::Rect>,
 }
 
 pub fn show(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) -> ChartOutcome {
@@ -56,7 +62,7 @@ pub fn show(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) -> ChartOutcome {
             is_hero: idx == 0,
             x_axis_label: x_axis_label_for(idx, count),
         };
-        let (interaction, hovered) = plot_group(ui, run, view, t, *group, height, position);
+        let (interaction, hovered, rect) = plot_group(ui, run, view, t, *group, height, position);
         if interaction.is_some() {
             outcome.interaction = interaction;
         }
@@ -64,6 +70,12 @@ pub fn show(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) -> ChartOutcome {
         // plot in the stack cannot erase an earlier one's hover.
         if hovered.is_some() {
             outcome.hovered_volume = hovered;
+        }
+        if rect.is_positive() {
+            outcome.rect = Some(match outcome.rect {
+                Some(sofar) => sofar.union(rect),
+                None => rect,
+            });
         }
     }
     outcome
@@ -260,7 +272,7 @@ fn plot_group(
     group: AxisGroup,
     height: f32,
     position: PlotPosition,
-) -> (Option<Interaction>, Option<f32>) {
+) -> (Option<Interaction>, Option<f32>, egui::Rect) {
     let PlotPosition {
         is_hero,
         x_axis_label,
@@ -274,7 +286,7 @@ fn plot_group(
         })
         .collect();
     if channels.is_empty() {
-        return (None, None);
+        return (None, None, egui::Rect::NOTHING);
     }
 
     let unit = channels
@@ -292,7 +304,7 @@ fn plot_group(
 
     let mut interaction = None;
     let mut hovered_volume = None;
-    Plot::new(format!("chromatogram-{group:?}"))
+    let plotted = Plot::new(format!("chromatogram-{group:?}"))
         .height(height)
         .sense(egui::Sense::click_and_drag())
         .link_axis("chromatogram-x", [true, false])
@@ -383,7 +395,9 @@ fn plot_group(
             }
         });
 
-    (interaction, hovered_volume)
+    // The plot's own rect, not `ui.min_rect()`: that would also cover whatever
+    // padding the parent card contributes, which is not part of the chart.
+    (interaction, hovered_volume, plotted.response.rect)
 }
 
 fn to_rgb(color: Color) -> Rgb {

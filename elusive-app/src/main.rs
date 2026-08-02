@@ -9,6 +9,7 @@
 
 mod app;
 mod egui_adapter;
+mod export_image;
 mod theme;
 mod view;
 mod widgets;
