@@ -6,4 +6,5 @@
 *.elusive.json
 
 # Real instrument exports are not redistributable; keep them out of the repo.
+/test/
 /testdata/private/
