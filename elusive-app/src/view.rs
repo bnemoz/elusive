@@ -216,6 +216,68 @@ impl XAxis {
     }
 }
 
+/// How the chromatogram maps trace values onto an axis group's y-axis.
+///
+/// This is display-only state. Nothing in `elusive-core` reads it: areas, heights
+/// and every exported number are computed from the stored samples, so switching
+/// mode changes what the plot looks like and never what the run measured.
+///
+/// It lives here rather than in `elusive-core` for the same reason, which is why
+/// the sidecar persists it as a string ([`YScaleMode::as_key`]) instead of the
+/// core owning an enum it has no use for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum YScaleMode {
+    /// One shared, data-derived range per axis group. The axis keeps the
+    /// instrument's unit and heights are directly comparable.
+    #[default]
+    AutoAll,
+    /// Every visible channel is normalized to its own data range, so a 40 mAU
+    /// trace and a 2000 mAU trace are both readable at once.
+    AutoEach,
+    /// Every channel is normalized from a user-entered range, which defaults to
+    /// its data range.
+    Custom,
+}
+
+impl YScaleMode {
+    pub const ALL: [YScaleMode; 3] = [
+        YScaleMode::AutoAll,
+        YScaleMode::AutoEach,
+        YScaleMode::Custom,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            YScaleMode::AutoAll => "Shared",
+            YScaleMode::AutoEach => "Auto each",
+            YScaleMode::Custom => "Custom",
+        }
+    }
+
+    /// Whether traces are remapped onto a unitless axis.
+    ///
+    /// The chromatogram keys the relative-axis label, the hover readout and the
+    /// "scaled" badges off this: once it is true the y-axis no longer carries the
+    /// instrument's unit and must not claim to.
+    pub fn is_per_trace(self) -> bool {
+        !matches!(self, YScaleMode::AutoAll)
+    }
+
+    /// Stable sidecar spelling. Kept separate from [`YScaleMode::label`] so the
+    /// UI wording can change without invalidating saved analyses.
+    pub fn as_key(self) -> &'static str {
+        match self {
+            YScaleMode::AutoAll => "auto-all",
+            YScaleMode::AutoEach => "auto-each",
+            YScaleMode::Custom => "custom",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|m| m.as_key() == key)
+    }
+}
+
 /// Which baseline the next integration will use.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum BaselineChoice {
@@ -309,6 +371,12 @@ pub struct View {
     /// override and the ChromLab legend colour it replaces share one
     /// representation, and the sidecar gains no second colour encoding.
     pub channel_colors: BTreeMap<ChannelId, Color>,
+    /// How the chromatogram scales each axis group's y-axis. Display only — see
+    /// [`YScaleMode`].
+    pub y_scale_mode: YScaleMode,
+    /// User-entered y range per channel, in *display* units, used by
+    /// [`YScaleMode::Custom`]. Absent means "fall back to the data range".
+    pub channel_y_ranges: BTreeMap<ChannelId, (f32, f32)>,
 
     /// Overview card order, left-to-right then top-to-bottom through the columns.
     pub overview_order: Vec<PanelId>,
@@ -364,6 +432,8 @@ impl Default for View {
             show_fractions: true,
             overview_order: PanelId::ALL.to_vec(),
             channel_colors: BTreeMap::new(),
+            y_scale_mode: YScaleMode::default(),
+            channel_y_ranges: BTreeMap::new(),
             x_axis: XAxis::Volume,
             hovered_vol_range: None,
             hovered_well: None,
@@ -397,6 +467,10 @@ impl View {
     pub fn adopt_run(&mut self, run: &Run) {
         self.hidden_channels.clear();
         self.channel_colors.clear();
+        // Custom ranges are in one run's display units against one run's channel
+        // ids; carrying them into the next run would silently clip a trace.
+        // The *mode* is a viewing preference and survives, like `show_fractions`.
+        self.channel_y_ranges.clear();
         self.peaks.clear();
         self.excluded_regions.clear();
         self.annotations.clear();
@@ -480,6 +554,42 @@ impl View {
     /// Drop an override so the channel falls back to the automatic colour.
     pub fn clear_channel_color(&mut self, id: &ChannelId) {
         if self.channel_colors.remove(id).is_some() {
+            self.dirty = true;
+        }
+    }
+
+    pub fn set_y_scale_mode(&mut self, mode: YScaleMode) {
+        if self.y_scale_mode != mode {
+            self.y_scale_mode = mode;
+            self.dirty = true;
+        }
+    }
+
+    /// The user's y range for a channel, in display units. `None` means the
+    /// chromatogram should fall back to the channel's own data range.
+    pub fn channel_y_range(&self, id: &ChannelId) -> Option<(f32, f32)> {
+        self.channel_y_ranges.get(id).copied()
+    }
+
+    /// Record a custom y range, in display units.
+    ///
+    /// Non-finite input is refused outright: a stored NaN would propagate into
+    /// every y coordinate in the group. An inverted or zero-width range *is*
+    /// stored, because rejecting it would fight the user halfway through typing
+    /// a new minimum; the chromatogram falls back to the data range and the
+    /// legend says so.
+    pub fn set_channel_y_range(&mut self, id: &ChannelId, lo: f32, hi: f32) {
+        if !lo.is_finite() || !hi.is_finite() {
+            return;
+        }
+        if self.channel_y_ranges.insert(id.clone(), (lo, hi)) != Some((lo, hi)) {
+            self.dirty = true;
+        }
+    }
+
+    /// Drop a custom range, returning the channel to its data range.
+    pub fn clear_channel_y_range(&mut self, id: &ChannelId) {
+        if self.channel_y_ranges.remove(id).is_some() {
             self.dirty = true;
         }
     }
@@ -658,6 +768,15 @@ impl View {
                     .collect(),
             ),
             x_axis: Some(self.x_axis.key().to_string()),
+            y_scale_mode: Some(self.y_scale_mode.as_key().to_string()),
+            // Omitted entirely when empty, so the common case does not add a
+            // dead object to every sidecar on disk.
+            channel_y_ranges: (!self.channel_y_ranges.is_empty()).then(|| {
+                self.channel_y_ranges
+                    .iter()
+                    .map(|(id, range)| (id.0.clone(), *range))
+                    .collect()
+            }),
         };
         sidecar
     }
@@ -749,6 +868,30 @@ impl View {
         // problem: the axis is a preference, not part of the analysis.
         if let Some(axis) = sidecar.view.x_axis.as_deref().and_then(XAxis::from_key) {
             self.x_axis = axis;
+        }
+        if let Some(key) = &sidecar.view.y_scale_mode {
+            match YScaleMode::from_key(key) {
+                Some(mode) => self.y_scale_mode = mode,
+                // A mode this build does not know is a display preference, not
+                // analysis: say so and carry on rather than refusing the file.
+                // Unlike `x_axis` above, this one is reported — a y-scale the
+                // file asked for and did not get changes how tall every trace
+                // looks, which is worth a line in the load notes.
+                None => notes.push(format!(
+                    "unknown y-scale mode '{key}'; using the shared scale"
+                )),
+            }
+        }
+        if let Some(ranges) = &sidecar.view.channel_y_ranges {
+            // Same rule as the colour overrides: a range for a channel this run
+            // lacks is dropped silently, and a hand-edited non-finite one never
+            // reaches the remap.
+            self.channel_y_ranges = ranges
+                .iter()
+                .filter(|(id, _)| run.channels.iter().any(|c| c.id.0 == **id))
+                .filter(|(_, (lo, hi))| lo.is_finite() && hi.is_finite())
+                .map(|(id, range)| (ChannelId(id.clone()), *range))
+                .collect();
         }
 
         self.dirty = false;
@@ -845,6 +988,8 @@ mod tests {
             Color::new(0xC4, 0x77, 0x3D, 0xFF),
         );
         view.set_x_axis(XAxis::Time);
+        view.set_y_scale_mode(YScaleMode::Custom);
+        view.set_channel_y_range(&ChannelId::from("MWave2"), -5.0, 250.0);
         let peak_id = view.allocate_peak_id();
         view.add_peak(PeakResult {
             id: peak_id,
@@ -874,7 +1019,125 @@ mod tests {
             Some(Color::new(0xC4, 0x77, 0x3D, 0xFF))
         );
         assert_eq!(restored.x_axis, XAxis::Time);
+        assert_eq!(restored.y_scale_mode, YScaleMode::Custom);
+        assert_eq!(
+            restored.channel_y_range(&ChannelId::from("MWave2")),
+            Some((-5.0, 250.0))
+        );
         assert!(!restored.dirty, "a freshly loaded sidecar is not dirty");
+    }
+
+    #[test]
+    fn a_sidecar_without_y_scale_fields_still_loads_on_the_shared_scale() {
+        // Every sidecar written before this feature existed.
+        let run = test_run();
+        let mut view = View {
+            y_scale_mode: YScaleMode::AutoEach,
+            ..View::default()
+        };
+        let notes = view.apply_sidecar(&Sidecar::for_run(&run), &run);
+        assert!(notes.is_empty());
+        assert_eq!(
+            view.y_scale_mode,
+            YScaleMode::AutoEach,
+            "an absent field means 'unstated', so the current preference stands"
+        );
+    }
+
+    #[test]
+    fn an_unknown_y_scale_mode_is_reported_rather_than_refusing_the_file() {
+        let run = test_run();
+        let mut sidecar = Sidecar::for_run(&run);
+        sidecar.view.y_scale_mode = Some("logarithmic-per-decade".into());
+        let mut view = View::default();
+        let notes = view.apply_sidecar(&sidecar, &run);
+        assert_eq!(view.y_scale_mode, YScaleMode::AutoAll);
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("logarithmic-per-decade"));
+    }
+
+    #[test]
+    fn y_scale_mode_keys_round_trip_and_do_not_collide() {
+        for mode in YScaleMode::ALL {
+            assert_eq!(YScaleMode::from_key(mode.as_key()), Some(mode));
+        }
+        assert_eq!(YScaleMode::from_key("nonsense"), None);
+    }
+
+    #[test]
+    fn a_custom_range_for_a_channel_this_run_lacks_is_dropped_on_restore() {
+        let run = test_run();
+        let mut sidecar = Sidecar::for_run(&run);
+        let mut ranges = BTreeMap::new();
+        ranges.insert("MWave2".to_string(), (0.0f32, 100.0f32));
+        ranges.insert("NoSuchChannel".to_string(), (0.0f32, 1.0f32));
+        sidecar.view.channel_y_ranges = Some(ranges);
+
+        let mut view = View::default();
+        view.apply_sidecar(&sidecar, &run);
+        assert_eq!(view.channel_y_ranges.len(), 1);
+        assert!(view
+            .channel_y_ranges
+            .contains_key(&ChannelId::from("MWave2")));
+    }
+
+    #[test]
+    fn a_non_finite_custom_range_is_refused_rather_than_stored() {
+        let mut view = View::default();
+        let id = ChannelId::from("MWave2");
+        view.set_channel_y_range(&id, f32::NAN, 100.0);
+        view.set_channel_y_range(&id, 0.0, f32::INFINITY);
+        assert_eq!(view.channel_y_range(&id), None);
+        assert!(!view.dirty);
+
+        // An inverted range *is* kept — the user may be mid-edit — and the
+        // chromatogram falls back to the data range rather than dividing by zero.
+        view.set_channel_y_range(&id, 100.0, 0.0);
+        assert_eq!(view.channel_y_range(&id), Some((100.0, 0.0)));
+        assert!(view.dirty);
+
+        view.clear_channel_y_range(&id);
+        assert_eq!(view.channel_y_range(&id), None);
+    }
+
+    #[test]
+    fn opening_another_run_does_not_inherit_the_previous_run_s_custom_ranges() {
+        // The numbers are in one run's display units; carrying them over would
+        // silently clip a trace in the new run.
+        let run = test_run();
+        let mut view = View::default();
+        view.set_channel_y_range(&ChannelId::from("MWave2"), 0.0, 100.0);
+        view.adopt_run(&run);
+        assert!(view.channel_y_ranges.is_empty());
+    }
+
+    #[test]
+    fn integration_results_do_not_depend_on_the_y_scale_mode() {
+        // The y-scale is a drawing decision. If it ever leaked into the numbers,
+        // the Results table and the CSV export would disagree with the instrument.
+        use elusive_core::integrate::integrate_peak;
+
+        let run = test_run();
+        let channel = run.channel(&ChannelId::from("MWave2")).expect("uv channel");
+
+        let mut results = Vec::new();
+        for mode in YScaleMode::ALL {
+            let mut view = View::default();
+            view.adopt_run(&run);
+            view.set_y_scale_mode(mode);
+            // Absurd on purpose: a range this narrow would clip the trace off the
+            // top of the plot, and must still leave the arithmetic untouched.
+            view.set_channel_y_range(&ChannelId::from("MWave2"), 0.0, 0.001);
+
+            let id = view.allocate_peak_id();
+            let peak = integrate_peak(id, channel, 0.0, 1.0, BaselineMode::DropToZero)
+                .expect("the window covers sampled volumes");
+            results.push((peak.area, peak.height, peak.apex_volume_ml));
+        }
+        assert!(
+            results.windows(2).all(|w| w[0] == w[1]),
+            "area/height/apex changed with the display scale: {results:?}"
+        );
     }
 
     #[test]
