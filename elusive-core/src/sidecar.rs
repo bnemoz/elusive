@@ -132,6 +132,44 @@ pub struct ViewState {
     /// the feature" and "the user cleared every range" are different facts.
     #[serde(default)]
     pub channel_y_ranges: Option<BTreeMap<String, (f32, f32)>>,
+    /// Comparison runs overlaid on this run's chromatogram, in display order.
+    ///
+    /// `Option` for the same reason as `channel_colors`: "this build never had
+    /// overlays" and "the user removed every comparison" are different facts.
+    /// The referenced runs' own sidecars are read-only inputs — saving this
+    /// sidecar never writes theirs.
+    #[serde(default)]
+    pub overlays: Option<Vec<OverlayRef>>,
+}
+
+/// One comparison run remembered by the primary run's sidecar.
+///
+/// Everything here is display state for the *primary*'s viewing session; the
+/// overlay run itself is opened read-only from `path` when the sidecar is
+/// restored, and a missing or unreadable file degrades to a status message
+/// rather than failing the load.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OverlayRef {
+    /// Preferably relative to the primary run's directory, so a folder of runs
+    /// copied to another machine keeps its comparisons; absolute when the two
+    /// paths share no common prefix.
+    pub path: String,
+    /// Master visibility toggle for the whole overlay.
+    #[serde(default = "default_true")]
+    pub visible: bool,
+    /// Display-only x shift in mL, applied on the volume axis. Never enters a
+    /// stored or computed result.
+    #[serde(default)]
+    pub x_offset_ml: f32,
+    /// Channel ids hidden within this overlay.
+    #[serde(default)]
+    pub hidden_channels: Vec<String>,
+}
+
+/// serde's `default` for a `bool` field is `false`; a hand-written ref that
+/// omits `visible` means "show it", so the default must be spelled out.
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -564,6 +602,40 @@ mod tests {
         let old = from_json(legacy).expect("a pre-y-scale sidecar should still parse");
         assert_eq!(old.view.y_scale_mode, None);
         assert_eq!(old.view.channel_y_ranges, None);
+    }
+
+    #[test]
+    fn overlay_refs_round_trip() {
+        let mut s = Sidecar::default();
+        s.view.overlays = Some(vec![OverlayRef {
+            path: "../std-run.ngcAnalysis".into(),
+            visible: true,
+            x_offset_ml: 0.25,
+            hidden_channels: vec!["MWave3".into()],
+        }]);
+        let back = from_json(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.view.overlays, s.view.overlays);
+    }
+
+    #[test]
+    fn a_sidecar_written_before_overlays_existed_loads_as_none() {
+        let json = r#"{"version": 1, "source": {"file_name":"run.ngcAnalysis","run_name":"r"},
+            "view": {"visible_channels":["MWave2"]}}"#;
+        assert_eq!(from_json(json).unwrap().view.overlays, None);
+    }
+
+    #[test]
+    fn an_overlay_ref_missing_optional_fields_gets_the_visible_default() {
+        // Hand-edited sidecars happen; a ref that names only the path must load
+        // as a visible overlay at zero offset rather than fail the file.
+        let json = r#"{"version": 1, "source": {"file_name":"run.ngcAnalysis","run_name":"r"},
+            "view": {"overlays": [{"path": "other.ngcAnalysis"}]}}"#;
+        let s = from_json(json).unwrap();
+        let refs = s.view.overlays.expect("overlays present");
+        assert_eq!(refs.len(), 1);
+        assert!(refs[0].visible);
+        assert_eq!(refs[0].x_offset_ml, 0.0);
+        assert!(refs[0].hidden_channels.is_empty());
     }
 
     #[test]

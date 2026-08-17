@@ -777,6 +777,9 @@ impl View {
                     .map(|(id, range)| (id.0.clone(), *range))
                     .collect()
             }),
+            // Overlays live beside the run in the app, not in `View`; the app
+            // fills this after `to_sidecar` (see `EluSiveApp::save_sidecar`).
+            overlays: None,
         };
         sidecar
     }
