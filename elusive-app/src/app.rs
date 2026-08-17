@@ -147,11 +147,13 @@ impl EluSiveApp {
 
                 // A sidecar next to the run is loaded automatically: the user's
                 // annotations should come back with the file, not on request.
+                let mut overlay_refs: Vec<sidecar::OverlayRef> = Vec::new();
                 let sidecar_path = run.sidecar_path();
                 if sidecar_path.is_file() {
                     match sidecar::load(&sidecar_path) {
                         Ok(s) => {
                             if s.matches(&run) {
+                                overlay_refs = s.view.overlays.clone().unwrap_or_default();
                                 let notes = self.view.apply_sidecar(&s, &run);
                                 for n in notes {
                                     self.note(ctx, n);
@@ -190,6 +192,11 @@ impl EluSiveApp {
                     }
                 }
 
+                let base = run
+                    .source_path
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_default();
                 self.run = Some(run);
                 // A new primary starts a new comparison: references chosen
                 // against the old run would silently mean something else here.
@@ -200,6 +207,31 @@ impl EluSiveApp {
                     ctx,
                     format!("Opened {name} — {channels} channels, {fractions} fractions"),
                 );
+
+                // Restore the comparison set the sidecar remembers. A missing
+                // or unreadable file costs its overlay and a note — never the run.
+                for r in overlay_refs {
+                    let overlay_path = overlay::resolve_overlay_path(&base, &r.path);
+                    match overlay::load_overlay(&overlay_path) {
+                        Ok(mut o) => {
+                            o.visible = r.visible;
+                            o.x_offset_ml = r.x_offset_ml;
+                            o.hidden_channels = r
+                                .hidden_channels
+                                .iter()
+                                .map(|id| elusive_core::model::ChannelId::from(id.as_str()))
+                                .collect();
+                            self.overlays.push(o);
+                        }
+                        Err(e) => self.note(ctx, format!("Comparison run not restored: {e}")),
+                    }
+                }
+                if !self.overlays.is_empty() {
+                    self.note(
+                        ctx,
+                        format!("Restored {} comparison run(s)", self.overlays.len()),
+                    );
+                }
             }
             Err(e) => {
                 self.error = Some(e.to_string());
@@ -324,6 +356,21 @@ impl EluSiveApp {
             Mode::Light => Some(false),
             Mode::System => None,
         };
+        // Comparison runs ride along in the primary's sidecar — relative paths
+        // where possible, so a folder of runs copied elsewhere keeps them. The
+        // overlays' own sidecars are never written.
+        let base = run.source_path.parent().unwrap_or(std::path::Path::new(""));
+        payload.view.overlays = Some(
+            self.overlays
+                .iter()
+                .map(|o| sidecar::OverlayRef {
+                    path: overlay::relative_or_absolute(base, &o.source_path),
+                    visible: o.visible,
+                    x_offset_ml: o.x_offset_ml,
+                    hidden_channels: o.hidden_channels.iter().map(|c| c.0.clone()).collect(),
+                })
+                .collect(),
+        );
         match sidecar::save(&path, &payload) {
             Ok(()) => {
                 self.view.dirty = false;
