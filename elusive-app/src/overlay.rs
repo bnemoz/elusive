@@ -237,6 +237,13 @@ fn csv_escape(field: &str) -> String {
 /// of runs copied to another machine keeps its comparisons; the absolute path
 /// only when there is nothing to be relative to (say, different Windows
 /// drives).
+///
+/// Relative refs are joined with `/` on every platform, never with
+/// `std::path::MAIN_SEPARATOR`: Windows resolves `/` natively, but a `\`
+/// written by a Windows machine is an ordinary file-name character to macOS
+/// and Linux, and the whole point of a relative ref is to survive the trip to
+/// another machine. Absolute fallbacks stay in native form — a path that names
+/// a specific drive was never portable to begin with.
 pub fn relative_or_absolute(base_dir: &Path, target: &Path) -> String {
     let base: Vec<Component<'_>> = base_dir.components().collect();
     let tgt: Vec<Component<'_>> = target.components().collect();
@@ -248,14 +255,19 @@ pub fn relative_or_absolute(base_dir: &Path, target: &Path) -> String {
     if common == 0 {
         return target.display().to_string();
     }
-    let mut rel = PathBuf::new();
+    let mut parts: Vec<String> = Vec::new();
     for _ in common..base.len() {
-        rel.push("..");
+        parts.push("..".to_string());
     }
     for c in &tgt[common..] {
-        rel.push(c.as_os_str());
+        parts.push(c.as_os_str().to_string_lossy().into_owned());
     }
-    rel.display().to_string()
+    if parts.is_empty() {
+        // `target` *is* the base directory — not a real run path, but refusing
+        // to invent one beats writing an empty ref.
+        return target.display().to_string();
+    }
+    parts.join("/")
 }
 
 /// Resolve a stored [`sidecar::OverlayRef::path`] against the primary's
@@ -465,6 +477,24 @@ mod tests {
         assert_eq!(
             resolve_overlay_path(Path::new("/data/runs"), "/elsewhere/std.ngcAnalysis"),
             PathBuf::from("/elsewhere/std.ngcAnalysis")
+        );
+    }
+
+    /// Relative refs must be `/`-joined on every platform: a `\` written by a
+    /// Windows machine is an ordinary character to macOS and Linux, and the ref
+    /// exists precisely to survive the trip between machines.
+    #[test]
+    fn relative_refs_use_forward_slashes_regardless_of_platform() {
+        let rel = relative_or_absolute(
+            Path::new("/data/runs/august"),
+            Path::new("/data/standards/gfs/std.ngcAnalysis"),
+        );
+        assert_eq!(rel, "../../standards/gfs/std.ngcAnalysis");
+        assert!(!rel.contains('\\'), "rel = {rel}");
+        // And they resolve back through the same round trip.
+        assert_eq!(
+            resolve_overlay_path(Path::new("/data/runs/august"), &rel),
+            PathBuf::from("/data/standards/gfs/std.ngcAnalysis")
         );
     }
 
