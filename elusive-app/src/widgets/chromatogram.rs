@@ -89,11 +89,7 @@ pub fn show(
             outcome.rect = Some(note);
         }
     }
-    if view.x_axis == XAxis::Time
-        && overlays
-            .iter()
-            .any(|o| o.visible && o.x_offset_ml != 0.0)
-    {
+    if view.x_axis == XAxis::Time && overlays.iter().any(|o| o.visible && o.x_offset_ml != 0.0) {
         let note = offset_ignored_note(ui, t);
         if note.is_positive() {
             outcome.rect = Some(match outcome.rect {
@@ -335,9 +331,7 @@ fn overlay_traces(overlays: &[Overlay], group: AxisGroup) -> Vec<OverlayTrace<'_
                 .iter()
                 .enumerate()
                 .filter(|(_, c)| {
-                    !c.is_empty()
-                        && c.kind.axis_group() == group
-                        && o.is_channel_visible(&c.id)
+                    !c.is_empty() && c.kind.axis_group() == group && o.is_channel_visible(&c.id)
                 })
                 .map(move |(channel_index, channel)| OverlayTrace {
                     channel,
@@ -979,9 +973,8 @@ fn plot_group(
             // so none of them re-applies the y transform to it. Comparison traces
             // join the extent on the shared scale; on the normalized axis the
             // extent is the fixed unitless span either way.
-            let (y_lo, y_hi) = tf
-                .y
-                .extent(extend_y_range(data_y_range(&channels), &otraces));
+            let (y_lo, y_hi) =
+                tf.y.extent(extend_y_range(data_y_range(&channels), &otraces));
 
             // 1. Fraction bands sit *under* the traces so the signal stays on top.
             if is_hero {
@@ -1723,8 +1716,7 @@ fn overlay_legend_groups(ui: &mut Ui, overlays: &mut Vec<Overlay>, view: &mut Vi
                     view.dirty = true;
                 }
 
-                let rgb =
-                    chart::legend_color_or_series(channel.color.map(to_rgb), t.panel_bg, i);
+                let rgb = chart::legend_color_or_series(channel.color.map(to_rgb), t.panel_bg, i);
                 let (swatch, _) = ui.allocate_exact_size(
                     egui::vec2(SWATCH_WIDTH, SWATCH_HEIGHT),
                     egui::Sense::hover(),
@@ -1960,9 +1952,12 @@ mod tests {
 
     #[test]
     fn overlay_channels_extend_the_group_y_range() {
-        let primary = vec![sampled("MWave2", ChannelKind::Uv, 10.0)];
+        let primary = [sampled("MWave2", ChannelKind::Uv, 10.0)];
         let channels: Vec<(usize, &Channel)> = primary.iter().enumerate().collect();
-        let overlay = overlay_around(run_with("o", vec![sampled("MWave2", ChannelKind::Uv, 25.0)]));
+        let overlay = overlay_around(run_with(
+            "o",
+            vec![sampled("MWave2", ChannelKind::Uv, 25.0)],
+        ));
         let traces = overlay_traces(std::slice::from_ref(&overlay), AxisGroup::Uv);
 
         let range = extend_y_range(data_y_range(&channels), &traces);
@@ -1978,7 +1973,10 @@ mod tests {
             vec![sampled("MD_Conductivity", ChannelKind::Conductivity, 1.0)],
         ));
         let groups = visible_groups(&primary, std::slice::from_ref(&overlay), &View::default());
-        assert!(groups.contains(&AxisGroup::Conductivity), "groups = {groups:?}");
+        assert!(
+            groups.contains(&AxisGroup::Conductivity),
+            "groups = {groups:?}"
+        );
     }
 
     #[test]

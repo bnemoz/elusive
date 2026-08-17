@@ -269,7 +269,10 @@ impl EluSiveApp {
         let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.into());
         let target = canon(path);
         if canon(&run.source_path) == target
-            || self.overlays.iter().any(|o| canon(&o.source_path) == target)
+            || self
+                .overlays
+                .iter()
+                .any(|o| canon(&o.source_path) == target)
         {
             self.note(ctx, format!("{} is already open", path.display()));
             return;
@@ -1326,9 +1329,7 @@ fn reports(ui: &mut egui::Ui, run: &Run, view: &mut View, overlays: &[Overlay], 
                     !overlays.is_empty(),
                     egui::Button::new("Run comparison (CSV)"),
                 )
-                .on_disabled_hover_text(
-                    "Open a comparison run first — toolbar: Add comparison…",
-                );
+                .on_disabled_hover_text("Open a comparison run first — toolbar: Add comparison…");
             if compare.clicked() {
                 DeferredAction::ComparisonCsv.raise(ui);
             }

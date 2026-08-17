@@ -321,6 +321,13 @@ Layout follows the brand mockup, adapted to EluSive's prep-chromatography domain
   `chart::PRIMARY_TRACE`; additional channels cycle `chart::SERIES` with dash
   patterns past eight (DESIGN_SYSTEM.md §10.4), or their ChromLab legend color when
   it meets the contrast anchors.
+- **Multi-run comparison** (v0.4): further runs open as read-only *overlays* on the
+  primary — traces join the axis-group stack behind the primary's, identified by a
+  per-run dash pattern plus the run-qualified legend name (never color alone), and
+  each run's saved peaks appear side by side in Results. One run stays primary and
+  owns integration, calibration, plate, and the sidecar; the comparison set (paths,
+  visibility, per-run mL x-offset) persists in the primary's sidecar. Design:
+  `docs/superpowers/specs/2026-08-17-multi-run-overlay-design.md`.
 
 **Domain note:** the mockup is a generic HPLC analysis screen (time axis, USP/tailing).
 EluSive adopts its *visual language* but keeps the prep-SEC feature set — volume axis,

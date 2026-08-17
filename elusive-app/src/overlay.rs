@@ -88,11 +88,7 @@ pub fn load_overlay(path: &Path) -> Result<Overlay, String> {
 /// "UV" alone would pair a 280 nm trace with a 495 nm one and invite a
 /// comparison that means nothing. Everything else starts hidden: comparing
 /// UV 280 across five productions must not require unticking dozens of boxes.
-pub fn default_hidden_channels(
-    overlay: &Run,
-    primary: &Run,
-    view: &View,
-) -> BTreeSet<ChannelId> {
+pub fn default_hidden_channels(overlay: &Run, primary: &Run, view: &View) -> BTreeSet<ChannelId> {
     overlay
         .channels
         .iter()
@@ -117,7 +113,7 @@ pub fn default_hidden_channels(
 /// patterns the identity repeats from the third overlay on; the legend and the
 /// hover readout still carry the run name, which is the authoritative label.
 pub fn overlay_dash(overlay_index: usize) -> chart::Dash {
-    if overlay_index % 2 == 0 {
+    if overlay_index.is_multiple_of(2) {
         chart::Dash::Dashed
     } else {
         chart::Dash::Dotted
@@ -149,7 +145,12 @@ pub fn comparison_rows(
     let mut rows = Vec::new();
     push_run_rows(&mut rows, run_label(primary), primary, primary_peaks);
     for overlay in overlays {
-        push_run_rows(&mut rows, overlay.label().to_string(), &overlay.run, &overlay.peaks);
+        push_run_rows(
+            &mut rows,
+            overlay.label().to_string(),
+            &overlay.run,
+            &overlay.peaks,
+        );
     }
     rows
 }
@@ -178,8 +179,7 @@ fn push_run_rows(rows: &mut Vec<ComparisonRow>, label: String, run: &Run, peaks:
             .channel(&p.channel_id)
             .map(|c| c.name.clone())
             .unwrap_or_else(|| p.channel_id.0.clone());
-        let fractions =
-            wells::join_well_labels(&run.wells_in_volume(p.v_start_ml, p.v_end_ml));
+        let fractions = wells::join_well_labels(&run.wells_in_volume(p.v_start_ml, p.v_end_ml));
         rows.push(ComparisonRow {
             run: label.clone(),
             channel_name,
@@ -298,8 +298,7 @@ mod tests {
     use crate::theme::chart;
     use crate::view::View;
     use elusive_core::model::{
-        BaselineMode, Channel, ChannelKind, PeakId, PeakResult, Run, RunMeta, Sample,
-        SourceFormat,
+        BaselineMode, Channel, ChannelKind, PeakId, PeakResult, Run, RunMeta, Sample, SourceFormat,
     };
     use std::path::{Path, PathBuf};
 
@@ -364,8 +363,14 @@ mod tests {
         view.set_channel_visible(&"MWave0".into(), false);
 
         let hidden = default_hidden_channels(&mini_run("other"), &primary, &view);
-        assert!(hidden.contains(&"MWave0".into()), "UV 215 should start hidden");
-        assert!(!hidden.contains(&"MWave2".into()), "UV 280 should start visible");
+        assert!(
+            hidden.contains(&"MWave0".into()),
+            "UV 215 should start hidden"
+        );
+        assert!(
+            !hidden.contains(&"MWave2".into()),
+            "UV 280 should start visible"
+        );
         assert!(
             !hidden.contains(&"MD_Conductivity".into()),
             "conductivity should start visible"
@@ -423,7 +428,10 @@ mod tests {
              estimated_mw,area_pct,fractions"
         );
         let row = csv.lines().nth(1).unwrap();
-        assert!(row.starts_with("primary,1,MWave2,12.0000,14.0000,13.0000,"), "row = {row}");
+        assert!(
+            row.starts_with("primary,1,MWave2,12.0000,14.0000,13.0000,"),
+            "row = {row}"
+        );
     }
 
     #[test]
@@ -442,7 +450,10 @@ mod tests {
             "../std.ngcAnalysis"
         );
         assert_eq!(
-            relative_or_absolute(Path::new("/data/runs"), Path::new("/data/runs/b.ngcAnalysis")),
+            relative_or_absolute(
+                Path::new("/data/runs"),
+                Path::new("/data/runs/b.ngcAnalysis")
+            ),
             "b.ngcAnalysis"
         );
         // Relative refs resolve back against the primary's directory.
@@ -455,6 +466,39 @@ mod tests {
             resolve_overlay_path(Path::new("/data/runs"), "/elsewhere/std.ngcAnalysis"),
             PathBuf::from("/elsewhere/std.ngcAnalysis")
         );
+    }
+
+    /// The committed instrument fixture, overlaid on itself. At offset zero the
+    /// two must be byte-for-byte the same traces; every channel of the overlay
+    /// must pair with its own twin and start visible.
+    #[test]
+    fn the_real_fixture_overlays_on_itself() {
+        let path = Path::new("../testdata/sec-run.ngcAnalysis");
+        let primary = elusive_core::parse::open(path).expect("fixture parses");
+        let overlay = load_overlay(path).expect("fixture loads as an overlay");
+
+        assert_eq!(overlay.run.channels.len(), primary.channels.len());
+        assert_eq!(overlay.x_offset_ml, 0.0);
+        assert!(overlay.visible);
+
+        // Same file, same channels: every non-empty channel matches its twin,
+        // so none of them may start hidden under the default view.
+        let hidden = default_hidden_channels(&overlay.run, &primary, &View::default());
+        let hidden_nonempty: Vec<_> = hidden
+            .iter()
+            .filter(|id| overlay.run.channel(id).is_some_and(|c| !c.is_empty()))
+            .collect();
+        assert!(hidden_nonempty.is_empty(), "hidden = {hidden_nonempty:?}");
+
+        // Trace payloads are identical, so the overlay draws exactly on top.
+        let a = primary.channel(&"MWave0".into()).expect("primary MWave0");
+        let b = overlay
+            .run
+            .channel(&"MWave0".into())
+            .expect("overlay MWave0");
+        assert_eq!(a.samples.len(), b.samples.len());
+        assert_eq!(a.samples.first(), b.samples.first());
+        assert_eq!(a.samples.last(), b.samples.last());
     }
 
     #[test]

@@ -30,8 +30,11 @@ an addition to the planned module list: a name-based XML flattener, needed becau
 them, and no real archive is available to read the hierarchy from.
 
 `elusive-app/src/` — `main.rs`, `app.rs`, `view.rs`, `theme.rs`, `egui_adapter.rs`,
-and `widgets/{mod,chromatogram,plate,panels,overview}.rs`. `view.rs` holds all
-mutable UI state so widgets can take `&Run` and `&mut View` simultaneously.
+`overlay.rs`, and `widgets/{mod,chromatogram,plate,panels,overview}.rs`. `view.rs`
+holds all mutable UI state so widgets can take `&Run` and `&mut View`
+simultaneously. `overlay.rs` holds the multi-run comparison model: extra runs
+open as read-only overlays beside the primary, which keeps all editing and the
+sidecar (spec: `docs/superpowers/specs/2026-08-17-multi-run-overlay-design.md`).
 `widgets/overview.rs` owns the Overview section's responsive column flow and its
 drag-to-rearrange cards; its layout arithmetic is pure and width-driven so it can
 be tested without a window.
