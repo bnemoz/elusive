@@ -972,7 +972,7 @@ fn linked_pane(
                     ui.separator();
                     ui.add_space(spacing::SM);
                     panels::heading(ui, t, "Channels");
-                    chromatogram::legend(ui, run, view, t);
+                    chromatogram::legend(ui, run, &mut Vec::new(), view, t);
                 });
         });
 

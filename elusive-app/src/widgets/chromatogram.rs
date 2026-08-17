@@ -1549,7 +1549,8 @@ fn channel_range_row(ui: &mut Ui, channel: &Channel, view: &mut View, t: Theme) 
 
 /// Legend with per-channel visibility, colour swatch, and unit — the control
 /// surface for Phase 2's show/hide requirement, and for the y-scale mode.
-pub fn legend(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) {
+/// Comparison runs get one group each below the primary's channels.
+pub fn legend(ui: &mut Ui, run: &Run, overlays: &mut Vec<Overlay>, view: &mut View, t: Theme) {
     y_scale_controls(ui, view, t);
     ui.add_space(spacing::XS);
 
@@ -1642,7 +1643,112 @@ pub fn legend(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) {
                     channel_range_row(ui, channel, view, t);
                 }
             }
+
+            overlay_legend_groups(ui, overlays, view, t);
         });
+}
+
+/// One legend group per comparison run: a header row (master toggle, run name,
+/// x-offset, Remove) over the run's channels.
+///
+/// Swatches here are display-only — the primary's colour overrides are keyed by
+/// [`ChannelId`], which is a per-run string (`MWave2` exists in every run), so
+/// extending overrides to overlays would collide. Overlay colours follow the
+/// same automatic resolution the primary gets, and the dash carries run
+/// identity (spec §3).
+fn overlay_legend_groups(ui: &mut Ui, overlays: &mut Vec<Overlay>, view: &mut View, t: Theme) {
+    let mut remove: Option<usize> = None;
+
+    for (idx, overlay) in overlays.iter_mut().enumerate() {
+        ui.add_space(spacing::SM);
+        ui.separator();
+
+        ui.horizontal(|ui| {
+            if ui
+                .checkbox(&mut overlay.visible, "")
+                .on_hover_text("Show or hide every trace of this comparison run")
+                .changed()
+            {
+                view.dirty = true;
+            }
+            ui.label(
+                egui::RichText::new(overlay.label())
+                    .font(adapt::font_h3())
+                    .color(c(t.text_primary)),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .small_button("Remove")
+                    .on_hover_text("Stop comparing this run. Its file and sidecar are untouched.")
+                    .clicked()
+                {
+                    remove = Some(idx);
+                }
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut overlay.x_offset_ml)
+                            .speed(0.05)
+                            .max_decimals(3)
+                            .suffix(" mL"),
+                    )
+                    .on_hover_text(
+                        "Display-only x shift for this run, to correct a system-volume \
+                         difference. Applies on the volume axis; never enters a result.",
+                    )
+                    .changed()
+                {
+                    view.dirty = true;
+                }
+                ui.label(
+                    egui::RichText::new("offset")
+                        .font(adapt::font_micro())
+                        .color(c(t.text_secondary)),
+                );
+            });
+        });
+
+        let dash = crate::overlay::overlay_dash(idx);
+        for (i, channel) in overlay.run.channels.iter().enumerate() {
+            if channel.is_empty() {
+                continue;
+            }
+            let mut visible = !overlay.hidden_channels.contains(&channel.id);
+            ui.horizontal(|ui| {
+                if ui.checkbox(&mut visible, "").changed() {
+                    if visible {
+                        overlay.hidden_channels.remove(&channel.id);
+                    } else {
+                        overlay.hidden_channels.insert(channel.id.clone());
+                    }
+                    view.dirty = true;
+                }
+
+                let rgb =
+                    chart::legend_color_or_series(channel.color.map(to_rgb), t.panel_bg, i);
+                let (swatch, _) = ui.allocate_exact_size(
+                    egui::vec2(SWATCH_WIDTH, SWATCH_HEIGHT),
+                    egui::Sense::hover(),
+                );
+                paint_swatch(ui.painter(), swatch, rgb, dash);
+
+                ui.label(egui::RichText::new(&channel.name).color(c(t.text_primary)));
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} · {} pts",
+                        channel.display_unit,
+                        channel.samples.len()
+                    ))
+                    .font(adapt::font_micro())
+                    .color(c(t.text_secondary)),
+                );
+            });
+        }
+    }
+
+    if let Some(idx) = remove {
+        overlays.remove(idx);
+        view.dirty = true;
+    }
 }
 
 /// The colour picker behind a legend swatch.
