@@ -344,6 +344,14 @@ impl EluSiveApp {
                 format!("{}-wells.csv", stem(run)),
                 sidecar::wells_to_csv(&plate::export_rows(run, &self.view)),
             ),
+            ExportKind::Comparison => (
+                format!("{}-comparison.csv", stem(run)),
+                overlay::comparison_to_csv(&overlay::comparison_rows(
+                    run,
+                    &self.view.peaks,
+                    &self.overlays,
+                )),
+            ),
         };
 
         let Some(path) = rfd::FileDialog::new()
@@ -896,10 +904,14 @@ impl EluSiveApp {
                                 .id_salt("results-scroll")
                                 .show(ui, |ui| {
                                     panels::results_table(ui, run, view, t);
+                                    if !overlays.is_empty() {
+                                        ui.add_space(spacing::LG);
+                                        panels::comparison_table(ui, run, view, overlays, t);
+                                    }
                                 });
                         });
                     }
-                    Section::Reports => reports(ui, run, view, t),
+                    Section::Reports => reports(ui, run, view, overlays, t),
                 }
             });
     }
@@ -979,6 +991,7 @@ fn stem(run: &Run) -> String {
 enum ExportKind {
     Peaks,
     Wells,
+    Comparison,
 }
 
 /// Something the Reports panel asked for, served once the frame's UI is built.
@@ -993,6 +1006,7 @@ enum ExportKind {
 enum DeferredAction {
     PeaksCsv,
     WellsCsv,
+    ComparisonCsv,
     MarkdownCopied,
     ChromatogramPng,
 }
@@ -1238,7 +1252,7 @@ fn resolve_hover(
     view.hovered_volume = hovered_volume;
 }
 
-fn reports(ui: &mut egui::Ui, run: &Run, view: &mut View, t: Theme) {
+fn reports(ui: &mut egui::Ui, run: &Run, view: &mut View, overlays: &[Overlay], t: Theme) {
     adapt::card(t).show(ui, |ui| {
         panels::heading(ui, t, "Export");
         ui.label(
@@ -1259,6 +1273,17 @@ fn reports(ui: &mut egui::Ui, run: &Run, view: &mut View, t: Theme) {
             }
             if ui.button("Plate metrics (CSV)").clicked() {
                 DeferredAction::WellsCsv.raise(ui);
+            }
+            let compare = ui
+                .add_enabled(
+                    !overlays.is_empty(),
+                    egui::Button::new("Run comparison (CSV)"),
+                )
+                .on_disabled_hover_text(
+                    "Open a comparison run first — toolbar: Add comparison…",
+                );
+            if compare.clicked() {
+                DeferredAction::ComparisonCsv.raise(ui);
             }
             // Unlike the file exports this needs nothing from `self`, so it can
             // run inline instead of going through the deferred-action channel.
@@ -1367,6 +1392,7 @@ impl eframe::App for EluSiveApp {
         match DeferredAction::take(ctx) {
             Some(DeferredAction::PeaksCsv) => self.export(ctx, ExportKind::Peaks),
             Some(DeferredAction::WellsCsv) => self.export(ctx, ExportKind::Wells),
+            Some(DeferredAction::ComparisonCsv) => self.export(ctx, ExportKind::Comparison),
             Some(DeferredAction::MarkdownCopied) => {
                 self.note(ctx, "Peak table copied as Markdown.")
             }
@@ -1419,7 +1445,13 @@ mod tests {
     fn each_deferred_action_round_trips_as_itself() {
         use DeferredAction::*;
 
-        for action in [PeaksCsv, WellsCsv, MarkdownCopied, ChromatogramPng] {
+        for action in [
+            PeaksCsv,
+            WellsCsv,
+            ComparisonCsv,
+            MarkdownCopied,
+            ChromatogramPng,
+        ] {
             let ctx = egui::Context::default();
             let _ = ctx.run_ui(egui::RawInput::default(), |ui| action.raise(ui));
 
