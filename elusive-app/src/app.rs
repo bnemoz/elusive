@@ -7,6 +7,7 @@
 
 use crate::egui_adapter::{self as adapt, c, Mode};
 use crate::export_image;
+use crate::overlay::{self, Overlay};
 use crate::theme::{color, measure, spacing, Theme};
 use crate::view::{BaselineChoice, Interaction, Section, View, XAxis};
 use crate::widgets::{self, chromatogram, panels, plate};
@@ -64,6 +65,10 @@ struct Capture {
 
 pub struct EluSiveApp {
     run: Option<Run>,
+    /// Comparison runs overlaid on the primary. References only: the primary
+    /// owns every edit and the sidecar; these are read-only inputs whose
+    /// display settings ride along in the primary's sidecar.
+    overlays: Vec<Overlay>,
     view: View,
     mode: Mode,
     theme: Theme,
@@ -74,6 +79,9 @@ pub struct EluSiveApp {
     styled: bool,
     /// A run named on the command line, opened on the first frame.
     pending_open: Option<std::path::PathBuf>,
+    /// A file dropped onto the window while a run is already open, held until
+    /// the user says whether it replaces the run or joins it as a comparison.
+    pending_drop: Option<std::path::PathBuf>,
     /// Where the chromatogram drew on the frame just rendered, in logical points.
     chart_rect: Option<egui::Rect>,
     capture: Option<Capture>,
@@ -88,6 +96,7 @@ impl EluSiveApp {
 
         Self {
             run: None,
+            overlays: Vec::new(),
             view: View::default(),
             mode,
             theme,
@@ -96,6 +105,7 @@ impl EluSiveApp {
             missing_fonts,
             styled: true,
             pending_open: None,
+            pending_drop: None,
             chart_rect: None,
             capture: None,
         }
@@ -137,11 +147,13 @@ impl EluSiveApp {
 
                 // A sidecar next to the run is loaded automatically: the user's
                 // annotations should come back with the file, not on request.
+                let mut overlay_refs: Vec<sidecar::OverlayRef> = Vec::new();
                 let sidecar_path = run.sidecar_path();
                 if sidecar_path.is_file() {
                     match sidecar::load(&sidecar_path) {
                         Ok(s) => {
                             if s.matches(&run) {
+                                overlay_refs = s.view.overlays.clone().unwrap_or_default();
                                 let notes = self.view.apply_sidecar(&s, &run);
                                 for n in notes {
                                     self.note(ctx, n);
@@ -180,18 +192,161 @@ impl EluSiveApp {
                     }
                 }
 
+                let base = run
+                    .source_path
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_default();
                 self.run = Some(run);
+                // A new primary starts a new comparison: references chosen
+                // against the old run would silently mean something else here.
+                self.overlays.clear();
                 self.error = None;
                 self.view.section = Section::Chromatograms;
                 self.note(
                     ctx,
                     format!("Opened {name} — {channels} channels, {fractions} fractions"),
                 );
+
+                // Restore the comparison set the sidecar remembers. A missing
+                // or unreadable file costs its overlay and a note — never the run.
+                for r in overlay_refs {
+                    let overlay_path = overlay::resolve_overlay_path(&base, &r.path);
+                    match overlay::load_overlay(&overlay_path) {
+                        Ok(mut o) => {
+                            o.visible = r.visible;
+                            o.x_offset_ml = r.x_offset_ml;
+                            o.hidden_channels = r
+                                .hidden_channels
+                                .iter()
+                                .map(|id| elusive_core::model::ChannelId::from(id.as_str()))
+                                .collect();
+                            self.overlays.push(o);
+                        }
+                        Err(e) => self.note(ctx, format!("Comparison run not restored: {e}")),
+                    }
+                }
+                if !self.overlays.is_empty() {
+                    self.note(
+                        ctx,
+                        format!("Restored {} comparison run(s)", self.overlays.len()),
+                    );
+                }
             }
             Err(e) => {
                 self.error = Some(e.to_string());
                 self.note(ctx, format!("Could not open {}: {e}", path.display()));
             }
+        }
+    }
+
+    /// Ask for a run file to overlay on the current one.
+    fn add_comparison_dialog(&mut self, ctx: &egui::Context) {
+        let picked = rfd::FileDialog::new()
+            .add_filter("NGC run", &["ngcAnalysis", "ngcMethodruns"])
+            .add_filter("ChromLab CSV export", &["csv"])
+            .add_filter("All files", &["*"])
+            .pick_file();
+        if let Some(path) = picked {
+            self.add_overlay(ctx, &path);
+        }
+    }
+
+    /// Open `path` as a comparison overlay beside the current run.
+    ///
+    /// A failure here is a status message, never `self.error`: the primary run
+    /// on screen is intact and the full-window error state would claim otherwise.
+    fn add_overlay(&mut self, ctx: &egui::Context, path: &std::path::Path) {
+        let Some(run) = &self.run else {
+            // Nothing to compare against yet — the drop/dialog simply opens it.
+            self.open_path(ctx, path);
+            return;
+        };
+
+        // Canonicalize for the duplicate check so `./run.ngcAnalysis` and its
+        // absolute spelling cannot open twice; fall back to the raw path when
+        // the file has just been renamed away.
+        let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.into());
+        let target = canon(path);
+        if canon(&run.source_path) == target
+            || self
+                .overlays
+                .iter()
+                .any(|o| canon(&o.source_path) == target)
+        {
+            self.note(ctx, format!("{} is already open", path.display()));
+            return;
+        }
+
+        match overlay::load_overlay(path) {
+            Ok(mut o) => {
+                o.hidden_channels = overlay::default_hidden_channels(&o.run, run, &self.view);
+                let name = o.label().to_string();
+                let peaks = o.peaks.len();
+                self.overlays.push(o);
+                self.view.dirty = true;
+                self.view.section = Section::Chromatograms;
+                self.note(
+                    ctx,
+                    format!(
+                        "Comparing {name} ({peaks} saved peak(s)) — {} runs on the chart",
+                        self.overlays.len() + 1
+                    ),
+                );
+            }
+            Err(e) => self.note(ctx, e),
+        }
+    }
+
+    /// The modal asking what a file dropped onto an open run should become.
+    fn drop_choice_dialog(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.pending_drop.clone() else {
+            return;
+        };
+        let name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+
+        #[derive(Clone, Copy)]
+        enum DropChoice {
+            Compare,
+            Replace,
+            Cancel,
+        }
+        let mut choice = None;
+
+        egui::Window::new("Open dropped run")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(format!("A run is already open. What should {name} be?"));
+                ui.add_space(spacing::SM);
+                ui.horizontal(|ui| {
+                    if ui.button("Add as comparison").clicked() {
+                        choice = Some(DropChoice::Compare);
+                    }
+                    if ui.button("Replace current run").clicked() {
+                        choice = Some(DropChoice::Replace);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        choice = Some(DropChoice::Cancel);
+                    }
+                });
+            });
+
+        match choice {
+            Some(DropChoice::Compare) => {
+                self.pending_drop = None;
+                self.add_overlay(ctx, &path);
+            }
+            Some(DropChoice::Replace) => {
+                self.pending_drop = None;
+                self.open_path(ctx, &path);
+            }
+            Some(DropChoice::Cancel) => self.pending_drop = None,
+            None => {}
         }
     }
 
@@ -204,6 +359,21 @@ impl EluSiveApp {
             Mode::Light => Some(false),
             Mode::System => None,
         };
+        // Comparison runs ride along in the primary's sidecar — relative paths
+        // where possible, so a folder of runs copied elsewhere keeps them. The
+        // overlays' own sidecars are never written.
+        let base = run.source_path.parent().unwrap_or(std::path::Path::new(""));
+        payload.view.overlays = Some(
+            self.overlays
+                .iter()
+                .map(|o| sidecar::OverlayRef {
+                    path: overlay::relative_or_absolute(base, &o.source_path),
+                    visible: o.visible,
+                    x_offset_ml: o.x_offset_ml,
+                    hidden_channels: o.hidden_channels.iter().map(|c| c.0.clone()).collect(),
+                })
+                .collect(),
+        );
         match sidecar::save(&path, &payload) {
             Ok(()) => {
                 self.view.dirty = false;
@@ -223,6 +393,14 @@ impl EluSiveApp {
             ExportKind::Wells => (
                 format!("{}-wells.csv", stem(run)),
                 sidecar::wells_to_csv(&plate::export_rows(run, &self.view)),
+            ),
+            ExportKind::Comparison => (
+                format!("{}-comparison.csv", stem(run)),
+                overlay::comparison_to_csv(&overlay::comparison_rows(
+                    run,
+                    &self.view.peaks,
+                    &self.overlays,
+                )),
             ),
         };
 
@@ -562,6 +740,16 @@ impl EluSiveApp {
 
                     let has_run = self.run.is_some();
                     ui.add_enabled_ui(has_run, |ui| {
+                        if ui
+                            .button("Add comparison…")
+                            .on_hover_text(
+                                "Overlay another run's traces on this chart. The comparison \
+                                 run is read-only; this run keeps all editing.",
+                            )
+                            .clicked()
+                        {
+                            self.add_comparison_dialog(ctx);
+                        }
                         let label = if self.view.dirty {
                             "Save analysis •"
                         } else {
@@ -726,14 +914,20 @@ impl EluSiveApp {
                     return;
                 }
 
-                // Split borrows: the run stays immutable, the view is mutable.
-                let EluSiveApp { run, view, .. } = self;
+                // Split borrows: the run stays immutable, the view is mutable,
+                // and the overlays' settings are the legend's to edit.
+                let EluSiveApp {
+                    run,
+                    view,
+                    overlays,
+                    ..
+                } = self;
                 let run = run.as_ref().expect("checked above");
 
                 match view.section {
                     Section::Overview => overview(ui, run, view, t),
                     Section::Chromatograms | Section::Peaks => {
-                        let (action, rect) = linked_pane(ui, run, view, t);
+                        let (action, rect) = linked_pane(ui, run, overlays, view, t);
                         self.chart_rect = rect;
                         if let Some(action) = action {
                             let ctx = ui.ctx().clone();
@@ -760,10 +954,14 @@ impl EluSiveApp {
                                 .id_salt("results-scroll")
                                 .show(ui, |ui| {
                                     panels::results_table(ui, run, view, t);
+                                    if !overlays.is_empty() {
+                                        ui.add_space(spacing::LG);
+                                        panels::comparison_table(ui, run, view, overlays, t);
+                                    }
                                 });
                         });
                     }
-                    Section::Reports => reports(ui, run, view, t),
+                    Section::Reports => reports(ui, run, view, overlays, t),
                 }
             });
     }
@@ -843,6 +1041,7 @@ fn stem(run: &Run) -> String {
 enum ExportKind {
     Peaks,
     Wells,
+    Comparison,
 }
 
 /// Something the Reports panel asked for, served once the frame's UI is built.
@@ -857,6 +1056,7 @@ enum ExportKind {
 enum DeferredAction {
     PeaksCsv,
     WellsCsv,
+    ComparisonCsv,
     MarkdownCopied,
     ChromatogramPng,
 }
@@ -949,6 +1149,7 @@ fn overview(ui: &mut egui::Ui, run: &Run, view: &mut View, t: Theme) {
 fn linked_pane(
     ui: &mut egui::Ui,
     run: &Run,
+    overlays: &mut Vec<Overlay>,
     view: &mut View,
     t: Theme,
 ) -> (Option<Interaction>, Option<egui::Rect>) {
@@ -972,7 +1173,7 @@ fn linked_pane(
                     ui.separator();
                     ui.add_space(spacing::SM);
                     panels::heading(ui, t, "Channels");
-                    chromatogram::legend(ui, run, view, t);
+                    chromatogram::legend(ui, run, overlays, view, t);
                 });
         });
 
@@ -1049,7 +1250,7 @@ fn linked_pane(
     egui::CentralPanel::default()
         .frame(adapt::card(t))
         .show(ui, |ui| {
-            outcome = chromatogram::show(ui, run, view, t);
+            outcome = chromatogram::show(ui, run, overlays, view, t);
         });
 
     resolve_hover(ui.ctx(), run, view, plate_hover, outcome.hovered_volume);
@@ -1101,7 +1302,7 @@ fn resolve_hover(
     view.hovered_volume = hovered_volume;
 }
 
-fn reports(ui: &mut egui::Ui, run: &Run, view: &mut View, t: Theme) {
+fn reports(ui: &mut egui::Ui, run: &Run, view: &mut View, overlays: &[Overlay], t: Theme) {
     adapt::card(t).show(ui, |ui| {
         panels::heading(ui, t, "Export");
         ui.label(
@@ -1122,6 +1323,15 @@ fn reports(ui: &mut egui::Ui, run: &Run, view: &mut View, t: Theme) {
             }
             if ui.button("Plate metrics (CSV)").clicked() {
                 DeferredAction::WellsCsv.raise(ui);
+            }
+            let compare = ui
+                .add_enabled(
+                    !overlays.is_empty(),
+                    egui::Button::new("Run comparison (CSV)"),
+                )
+                .on_disabled_hover_text("Open a comparison run first — toolbar: Add comparison…");
+            if compare.clicked() {
+                DeferredAction::ComparisonCsv.raise(ui);
             }
             // Unlike the file exports this needs nothing from `self`, so it can
             // run inline instead of going through the deferred-action channel.
@@ -1210,8 +1420,15 @@ impl eframe::App for EluSiveApp {
                 .collect()
         });
         if let Some(path) = dropped.first() {
-            self.open_path(ctx, path);
+            if self.run.is_some() {
+                // Replacing silently would throw away the open analysis; adding
+                // silently would surprise anyone expecting the old behaviour.
+                self.pending_drop = Some(path.clone());
+            } else {
+                self.open_path(ctx, path);
+            }
         }
+        self.drop_choice_dialog(ctx);
 
         self.nav(ui);
         self.toolbar(ui);
@@ -1223,6 +1440,7 @@ impl eframe::App for EluSiveApp {
         match DeferredAction::take(ctx) {
             Some(DeferredAction::PeaksCsv) => self.export(ctx, ExportKind::Peaks),
             Some(DeferredAction::WellsCsv) => self.export(ctx, ExportKind::Wells),
+            Some(DeferredAction::ComparisonCsv) => self.export(ctx, ExportKind::Comparison),
             Some(DeferredAction::MarkdownCopied) => {
                 self.note(ctx, "Peak table copied as Markdown.")
             }
@@ -1275,7 +1493,13 @@ mod tests {
     fn each_deferred_action_round_trips_as_itself() {
         use DeferredAction::*;
 
-        for action in [PeaksCsv, WellsCsv, MarkdownCopied, ChromatogramPng] {
+        for action in [
+            PeaksCsv,
+            WellsCsv,
+            ComparisonCsv,
+            MarkdownCopied,
+            ChromatogramPng,
+        ] {
             let ctx = egui::Context::default();
             let _ = ctx.run_ui(egui::RawInput::default(), |ui| action.raise(ui));
 

@@ -43,6 +43,12 @@ empty grid.
   or custom y scale for each trace; and set a trace colour directly from its
   legend. Hover readouts identify the fraction and integrated peak under the
   cursor.
+- **Compare runs** — overlay other runs on the same plot (*Add comparison…* in
+  the toolbar, or drop a file onto an open run) to compare productions directly.
+  Comparison traces are told apart by dash pattern and run name, never colour
+  alone; each run takes an optional display-only volume offset; and every run's
+  saved peaks line up side by side in Results, exportable as a comparison CSV.
+  Comparison runs are read-only — the run you opened first keeps all editing.
 - **Fractions and plates** — see collected fractions on the plate, hover from
   chart to well (and back), and include the overlapping fractions in Results and
   CSV exports.

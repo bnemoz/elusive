@@ -22,6 +22,7 @@
 //! ([`ChartOutcome`], [`Interaction`]) is in mL. See [`PlotTransform`].
 
 use crate::egui_adapter::{self as adapt, c, c_alpha, ca};
+use crate::overlay::Overlay;
 use crate::theme::{chart, color, spacing, stroke, Rgb, Theme};
 use crate::view::{Interaction, View, XAxis, YScaleMode};
 use egui::Ui;
@@ -63,8 +64,14 @@ pub struct ChartOutcome {
     pub rect: Option<egui::Rect>,
 }
 
-pub fn show(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) -> ChartOutcome {
-    let groups = visible_groups(run, view);
+pub fn show(
+    ui: &mut Ui,
+    run: &Run,
+    overlays: &[Overlay],
+    view: &mut View,
+    t: Theme,
+) -> ChartOutcome {
+    let groups = visible_groups(run, overlays, view);
     if groups.is_empty() {
         ui.centered_and_justified(|ui| {
             ui.label(
@@ -82,6 +89,15 @@ pub fn show(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) -> ChartOutcome {
             outcome.rect = Some(note);
         }
     }
+    if view.x_axis == XAxis::Time && overlays.iter().any(|o| o.visible && o.x_offset_ml != 0.0) {
+        let note = offset_ignored_note(ui, t);
+        if note.is_positive() {
+            outcome.rect = Some(match outcome.rect {
+                Some(sofar) => sofar.union(note),
+                None => note,
+            });
+        }
+    }
     // Read *after* the note, so the plots are laid out in what is actually left
     // rather than in space the note has already taken.
     let total = ui.available_height();
@@ -93,7 +109,8 @@ pub fn show(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) -> ChartOutcome {
             is_hero: idx == 0,
             x_axis_label: x_axis_label_for(idx, count, view.x_axis),
         };
-        let (interaction, hovered, rect) = plot_group(ui, run, view, t, *group, height, position);
+        let (interaction, hovered, rect) =
+            plot_group(ui, run, overlays, view, t, *group, height, position);
         if interaction.is_some() {
             outcome.interaction = interaction;
         }
@@ -142,6 +159,32 @@ fn relative_axis_note(ui: &mut Ui, t: Theme) -> egui::Rect {
     drawn.response.rect
 }
 
+/// The standing caveat that a comparison run's x-offset is not being applied.
+///
+/// Shown while the time axis is active and any visible overlay carries a
+/// nonzero offset. Same always-on-screen reasoning as [`relative_axis_note`]:
+/// a screenshot of misaligned traces must carry the reason for the
+/// misalignment with it.
+fn offset_ignored_note(ui: &mut Ui, t: Theme) -> egui::Rect {
+    let drawn = ui.horizontal_wrapped(|ui| {
+        ui.label(
+            egui::RichText::new("X offsets not applied")
+                .font(adapt::font_micro())
+                .color(c(color::WARNING_600)),
+        );
+        ui.label(
+            egui::RichText::new(
+                "— comparison-run offsets are in mL and apply on the volume axis only; \
+                 on the time axis every trace is at its own recorded time.",
+            )
+            .font(adapt::font_micro())
+            .color(c(t.text_secondary)),
+        );
+    });
+    ui.add_space(spacing::XS);
+    drawn.response.rect
+}
+
 /// Where a plot sits in the stack, and what that implies for its chrome.
 ///
 /// `is_hero` (top plot, own y-axis overlays) and the x-axis label (bottom plot
@@ -170,7 +213,7 @@ fn x_axis_label_for(idx: usize, count: usize, axis: XAxis) -> &'static str {
 }
 
 /// Axis groups that currently have at least one visible channel, hero group first.
-fn visible_groups(run: &Run, view: &View) -> Vec<AxisGroup> {
+fn visible_groups(run: &Run, overlays: &[Overlay], view: &View) -> Vec<AxisGroup> {
     let hero_group = view
         .hero_channel_id
         .as_ref()
@@ -183,6 +226,18 @@ fn visible_groups(run: &Run, view: &View) -> Vec<AxisGroup> {
         .filter(|c| !c.is_empty() && view.is_channel_visible(&c.id))
         .map(|c| c.kind.axis_group())
         .collect();
+    // A comparison run can bring a channel kind the primary never recorded —
+    // its plot still deserves to exist, or the overlay would silently not show.
+    for overlay in overlays.iter().filter(|o| o.visible) {
+        groups.extend(
+            overlay
+                .run
+                .channels
+                .iter()
+                .filter(|c| !c.is_empty() && overlay.is_channel_visible(&c.id))
+                .map(|c| c.kind.axis_group()),
+        );
+    }
     groups.sort();
     groups.dedup();
     if let Some(hero) = hero_group {
@@ -241,6 +296,129 @@ fn data_y_range(channels: &[(usize, &Channel)]) -> (f64, f64) {
         return (0.0, 1.0);
     }
     (lo, hi)
+}
+
+/// One comparison-run channel resolved for drawing on a group's plot.
+///
+/// Resolved once per group rather than inside the plot closure, so the same
+/// facts feed the y-extent, the drawing and the legend name. Identity is the
+/// dash pattern plus the run-qualified name — never colour alone (rule #3);
+/// colour deliberately follows the same resolution a primary channel gets, so
+/// UV 280 shares a hue across runs and the dash is what says "other run".
+struct OverlayTrace<'a> {
+    channel: &'a Channel,
+    /// The channel's index within its own run, for colour cycling.
+    channel_index: usize,
+    dash: chart::Dash,
+    /// Run-qualified legend name, e.g. `2026-08-02 prep · UV 280 nm`.
+    name: String,
+    /// Display-only x shift in mL; ignored on the time axis.
+    offset_ml: f32,
+}
+
+/// The overlay channels that belong on one axis group's plot.
+///
+/// Dash identity keys off each overlay's position in the full list, not off
+/// how many are currently visible, so hiding one run never restyles another.
+fn overlay_traces(overlays: &[Overlay], group: AxisGroup) -> Vec<OverlayTrace<'_>> {
+    overlays
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| o.visible)
+        .flat_map(|(run_index, o)| {
+            o.run
+                .channels
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| {
+                    !c.is_empty() && c.kind.axis_group() == group && o.is_channel_visible(&c.id)
+                })
+                .map(move |(channel_index, channel)| OverlayTrace {
+                    channel,
+                    channel_index,
+                    dash: crate::overlay::overlay_dash(run_index),
+                    name: format!("{} · {}", o.label(), channel.name),
+                    offset_ml: o.x_offset_ml,
+                })
+        })
+        .collect()
+}
+
+/// Grow a group's y-extent to enclose its overlay traces.
+///
+/// Same no-feedback rule as [`data_y_range`]: derived from the data, never from
+/// the plot's current bounds. A taller comparison trace must widen the axis, or
+/// it would leave the top of the plot and invite reading the crop as a plateau.
+fn extend_y_range(range: (f64, f64), traces: &[OverlayTrace<'_>]) -> (f64, f64) {
+    let (mut lo, mut hi) = range;
+    for t in traces {
+        if let Some((clo, chi)) = t.channel.display_value_range() {
+            lo = lo.min(clo as f64);
+            hi = hi.max(chi as f64);
+        }
+    }
+    (lo, hi)
+}
+
+/// x coordinate for an overlay sample.
+///
+/// The offset applies on the volume axis only: it corrects a system-volume
+/// difference in mL, which has no constant time equivalent under gradient
+/// flow, so on the time axis the sample plots at its own recorded time and
+/// [`show`] posts a standing note instead.
+fn overlay_sample_x(axis: XAxis, s: &Sample, offset_ml: f32) -> f64 {
+    match axis {
+        XAxis::Volume => (s.volume_ml + offset_ml) as f64,
+        XAxis::Time => s.time_s as f64 / 60.0,
+    }
+}
+
+/// Draw one comparison trace. Kept apart from [`draw_channel`] because none of
+/// the primary's per-channel view state (selection, colour overrides, custom
+/// y-ranges) applies here, and pretending it might would invite id collisions —
+/// `MWave2` names a different channel in every run.
+fn draw_overlay_trace(
+    plot_ui: &mut egui_plot::PlotUi<'_>,
+    trace: &OverlayTrace<'_>,
+    axis: XAxis,
+    normalized: bool,
+    surface: Rgb,
+) {
+    let own_range = trace
+        .channel
+        .display_value_range()
+        .and_then(|(lo, hi)| usable_range(lo as f64, hi as f64));
+    let points: Vec<[f64; 2]> = trace
+        .channel
+        .samples
+        .iter()
+        .filter(|s| s.is_finite())
+        .map(|s| {
+            let y = (s.value * trace.channel.display_scale) as f64;
+            let y = if normalized {
+                // Remapped against the overlay channel's own range — not through
+                // `YMap`, whose `ChannelId` keys collide across runs.
+                remap(y, own_range.unwrap_or((0.0, 0.0)), (NORM_LO, NORM_HI))
+            } else {
+                y
+            };
+            [overlay_sample_x(axis, s, trace.offset_ml), y]
+        })
+        .collect();
+    if points.len() < 2 {
+        return;
+    }
+
+    let rgb = chart::legend_color_or_series(
+        trace.channel.color.map(to_rgb),
+        surface,
+        trace.channel_index,
+    );
+    plot_ui.line(
+        Line::new(trace.name.clone(), PlotPoints::from(points))
+            .stroke(egui::Stroke::new(stroke::TRACE, c(rgb)))
+            .style(adapt::line_style(trace.dash)),
+    );
 }
 
 /// The unitless axis a per-trace-scaled group is drawn on.
@@ -684,9 +862,11 @@ fn hover_label(
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn plot_group(
     ui: &mut Ui,
     run: &Run,
+    overlays: &[Overlay],
     view: &mut View,
     t: Theme,
     group: AxisGroup,
@@ -705,13 +885,17 @@ fn plot_group(
             !c.is_empty() && c.kind.axis_group() == group && view.is_channel_visible(&c.id)
         })
         .collect();
-    if channels.is_empty() {
+    let otraces = overlay_traces(overlays, group);
+    if channels.is_empty() && otraces.is_empty() {
         return (None, None, egui::Rect::NOTHING);
     }
 
+    // A group can exist purely for a comparison run, so the unit falls back to
+    // the overlay channel's when the primary has nothing in this group.
     let unit = channels
         .first()
         .map(|(_, c)| c.display_unit.clone())
+        .or_else(|| otraces.first().map(|o| o.channel.display_unit.clone()))
         .unwrap_or_default();
 
     // While integrating, dragging draws a selection instead of panning.
@@ -786,8 +970,11 @@ fn plot_group(
         .show(ui, |plot_ui| {
             // Fixed, data-derived extent. Deliberately NOT `plot_ui.plot_bounds()`
             // — see `data_y_range`. The drawers below receive it already mapped,
-            // so none of them re-applies the y transform to it.
-            let (y_lo, y_hi) = tf.y.extent(data_y_range(&channels));
+            // so none of them re-applies the y transform to it. Comparison traces
+            // join the extent on the shared scale; on the normalized axis the
+            // extent is the fixed unitless span either way.
+            let (y_lo, y_hi) =
+                tf.y.extent(extend_y_range(data_y_range(&channels), &otraces));
 
             // 1. Fraction bands sit *under* the traces so the signal stays on top.
             if is_hero {
@@ -799,12 +986,18 @@ fn plot_group(
             // 2. Integrated peak regions, translucent (rule #2).
             draw_peak_regions(plot_ui, view, group, run, tf, y_lo);
 
-            // 3. The traces themselves.
+            // 3. Comparison traces first, so the primary run stays on top —
+            //    its raw trace is the one every annotation refers to.
+            for trace in &otraces {
+                draw_overlay_trace(plot_ui, trace, axis, normalized, t.panel_bg);
+            }
+
+            // 4. The primary's traces themselves.
             for (i, channel) in &channels {
                 draw_channel(plot_ui, channel, *i, view, t, tf);
             }
 
-            // 4. The pending drag selection, so the user sees the window forming.
+            // 5. The pending drag selection, so the user sees the window forming.
             //    Already in display units — see the drag handling below — so it
             //    needs no x mapping.
             if let Some((a, b)) = view.pending_selection {
@@ -1349,7 +1542,8 @@ fn channel_range_row(ui: &mut Ui, channel: &Channel, view: &mut View, t: Theme) 
 
 /// Legend with per-channel visibility, colour swatch, and unit — the control
 /// surface for Phase 2's show/hide requirement, and for the y-scale mode.
-pub fn legend(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) {
+/// Comparison runs get one group each below the primary's channels.
+pub fn legend(ui: &mut Ui, run: &Run, overlays: &mut Vec<Overlay>, view: &mut View, t: Theme) {
     y_scale_controls(ui, view, t);
     ui.add_space(spacing::XS);
 
@@ -1442,7 +1636,111 @@ pub fn legend(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) {
                     channel_range_row(ui, channel, view, t);
                 }
             }
+
+            overlay_legend_groups(ui, overlays, view, t);
         });
+}
+
+/// One legend group per comparison run: a header row (master toggle, run name,
+/// x-offset, Remove) over the run's channels.
+///
+/// Swatches here are display-only — the primary's colour overrides are keyed by
+/// [`ChannelId`], which is a per-run string (`MWave2` exists in every run), so
+/// extending overrides to overlays would collide. Overlay colours follow the
+/// same automatic resolution the primary gets, and the dash carries run
+/// identity (spec §3).
+fn overlay_legend_groups(ui: &mut Ui, overlays: &mut Vec<Overlay>, view: &mut View, t: Theme) {
+    let mut remove: Option<usize> = None;
+
+    for (idx, overlay) in overlays.iter_mut().enumerate() {
+        ui.add_space(spacing::SM);
+        ui.separator();
+
+        ui.horizontal(|ui| {
+            if ui
+                .checkbox(&mut overlay.visible, "")
+                .on_hover_text("Show or hide every trace of this comparison run")
+                .changed()
+            {
+                view.dirty = true;
+            }
+            ui.label(
+                egui::RichText::new(overlay.label())
+                    .font(adapt::font_h3())
+                    .color(c(t.text_primary)),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .small_button("Remove")
+                    .on_hover_text("Stop comparing this run. Its file and sidecar are untouched.")
+                    .clicked()
+                {
+                    remove = Some(idx);
+                }
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut overlay.x_offset_ml)
+                            .speed(0.05)
+                            .max_decimals(3)
+                            .suffix(" mL"),
+                    )
+                    .on_hover_text(
+                        "Display-only x shift for this run, to correct a system-volume \
+                         difference. Applies on the volume axis; never enters a result.",
+                    )
+                    .changed()
+                {
+                    view.dirty = true;
+                }
+                ui.label(
+                    egui::RichText::new("offset")
+                        .font(adapt::font_micro())
+                        .color(c(t.text_secondary)),
+                );
+            });
+        });
+
+        let dash = crate::overlay::overlay_dash(idx);
+        for (i, channel) in overlay.run.channels.iter().enumerate() {
+            if channel.is_empty() {
+                continue;
+            }
+            let mut visible = !overlay.hidden_channels.contains(&channel.id);
+            ui.horizontal(|ui| {
+                if ui.checkbox(&mut visible, "").changed() {
+                    if visible {
+                        overlay.hidden_channels.remove(&channel.id);
+                    } else {
+                        overlay.hidden_channels.insert(channel.id.clone());
+                    }
+                    view.dirty = true;
+                }
+
+                let rgb = chart::legend_color_or_series(channel.color.map(to_rgb), t.panel_bg, i);
+                let (swatch, _) = ui.allocate_exact_size(
+                    egui::vec2(SWATCH_WIDTH, SWATCH_HEIGHT),
+                    egui::Sense::hover(),
+                );
+                paint_swatch(ui.painter(), swatch, rgb, dash);
+
+                ui.label(egui::RichText::new(&channel.name).color(c(t.text_primary)));
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} · {} pts",
+                        channel.display_unit,
+                        channel.samples.len()
+                    ))
+                    .font(adapt::font_micro())
+                    .color(c(t.text_secondary)),
+                );
+            });
+        }
+    }
+
+    if let Some(idx) = remove {
+        overlays.remove(idx);
+        view.dirty = true;
+    }
 }
 
 /// The colour picker behind a legend swatch.
@@ -1610,6 +1908,102 @@ mod tests {
         assert_eq!(x_axis_label_for(0, 3, XAxis::Volume), "");
         assert_eq!(x_axis_label_for(1, 3, XAxis::Volume), "");
         assert_eq!(x_axis_label_for(2, 3, XAxis::Volume), "Elution volume (mL)");
+    }
+
+    // --- comparison overlays ------------------------------------------------
+
+    use crate::overlay::Overlay;
+
+    fn run_with(name: &str, channels: Vec<Channel>) -> Run {
+        Run {
+            meta: RunMeta {
+                run_name: name.to_string(),
+                ..RunMeta::default()
+            },
+            source_format: SourceFormat::NgcAnalysis,
+            source_path: std::path::PathBuf::from(format!("{name}.ngcAnalysis")),
+            channels,
+            fractions: Vec::new(),
+            events: Vec::new(),
+            warnings: Vec::new(),
+        }
+    }
+
+    fn sampled(id: &str, kind: ChannelKind, peak_value: f32) -> Channel {
+        let mut c = Channel::new(id, id, kind);
+        c.samples = vec![
+            Sample::new(0.0, 0.0, 0.0),
+            Sample::new(60.0, 1.0, peak_value),
+            Sample::new(120.0, 2.0, 0.0),
+        ];
+        c
+    }
+
+    fn overlay_around(run: Run) -> Overlay {
+        Overlay {
+            source_path: run.source_path.clone(),
+            run,
+            peaks: Vec::new(),
+            visible: true,
+            hidden_channels: Default::default(),
+            x_offset_ml: 0.0,
+        }
+    }
+
+    #[test]
+    fn overlay_channels_extend_the_group_y_range() {
+        let primary = [sampled("MWave2", ChannelKind::Uv, 10.0)];
+        let channels: Vec<(usize, &Channel)> = primary.iter().enumerate().collect();
+        let overlay = overlay_around(run_with(
+            "o",
+            vec![sampled("MWave2", ChannelKind::Uv, 25.0)],
+        ));
+        let traces = overlay_traces(std::slice::from_ref(&overlay), AxisGroup::Uv);
+
+        let range = extend_y_range(data_y_range(&channels), &traces);
+        assert!((range.1 - 25.0).abs() < 1e-6, "hi = {}", range.1);
+        assert!((range.0 - 0.0).abs() < 1e-6, "lo = {}", range.0);
+    }
+
+    #[test]
+    fn overlay_groups_appear_even_without_primary_channels() {
+        let primary = run_with("p", vec![sampled("MWave2", ChannelKind::Uv, 1.0)]);
+        let overlay = overlay_around(run_with(
+            "o",
+            vec![sampled("MD_Conductivity", ChannelKind::Conductivity, 1.0)],
+        ));
+        let groups = visible_groups(&primary, std::slice::from_ref(&overlay), &View::default());
+        assert!(
+            groups.contains(&AxisGroup::Conductivity),
+            "groups = {groups:?}"
+        );
+    }
+
+    #[test]
+    fn offset_moves_volume_x_only() {
+        let s = Sample::new(90.0, 1.5, 0.2);
+        assert!((overlay_sample_x(XAxis::Volume, &s, 0.25) - 1.75).abs() < 1e-6);
+        // A mL offset has no constant time equivalent: ignored on the time axis.
+        assert!((overlay_sample_x(XAxis::Time, &s, 0.25) - 1.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn hidden_channels_and_invisible_overlays_contribute_no_traces() {
+        let mut hidden_run =
+            overlay_around(run_with("a", vec![sampled("MWave2", ChannelKind::Uv, 1.0)]));
+        hidden_run.visible = false;
+        let mut hidden_channel =
+            overlay_around(run_with("b", vec![sampled("MWave2", ChannelKind::Uv, 1.0)]));
+        hidden_channel.hidden_channels.insert("MWave2".into());
+        let shown = overlay_around(run_with("c", vec![sampled("MWave2", ChannelKind::Uv, 1.0)]));
+
+        let overlays = vec![hidden_run, hidden_channel, shown];
+        let traces = overlay_traces(&overlays, AxisGroup::Uv);
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].name, "c · MWave2");
+        // Dash identity keys off the overlay's position in the list, not off how
+        // many happen to be visible, so hiding one never restyles another.
+        assert_eq!(traces[0].dash, crate::theme::chart::Dash::Dashed);
     }
 
     // --- hover readout ----------------------------------------------------

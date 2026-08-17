@@ -1008,6 +1008,103 @@ pub fn results_table(ui: &mut Ui, run: &Run, view: &mut View, t: Theme) {
         });
 }
 
+/// The cross-run peak comparison: the primary's live peaks beside each
+/// comparison run's saved ones.
+///
+/// Overlay rows are read-only by design — editing targets the primary. A run
+/// with nothing to show gets an explicit row rather than silently contributing
+/// nothing: "this run has no saved analysis" and "this run's peaks are all
+/// here" must not render identically.
+pub fn comparison_table(
+    ui: &mut Ui,
+    run: &Run,
+    view: &View,
+    overlays: &[crate::overlay::Overlay],
+    t: Theme,
+) {
+    heading(ui, t, "Run comparison");
+    ui.label(
+        egui::RichText::new(
+            "Peaks from each open run, side by side. Comparison-run peaks come from their \
+             own saved analysis (.elusive.json) and are read-only here.",
+        )
+        .font(font_micro())
+        .color(c(t.text_secondary)),
+    );
+    ui.add_space(spacing::SM);
+
+    let rows = crate::overlay::comparison_rows(run, &view.peaks, overlays);
+
+    egui::Grid::new("run-comparison")
+        .num_columns(8)
+        .spacing([spacing::LG, spacing::XS])
+        .show(ui, |ui| {
+            table_header_row(
+                ui,
+                t,
+                &[
+                    "Run",
+                    "Channel",
+                    "Ve (mL)",
+                    "Area",
+                    "Area %",
+                    "Height",
+                    "FWHM (mL)",
+                    "Est. MW (kDa)",
+                ],
+            );
+
+            let dim_dash = |ui: &mut Ui| {
+                ui.label(egui::RichText::new("—").color(c(t.text_secondary)));
+            };
+            for row in &rows {
+                ui.label(egui::RichText::new(&row.run).color(c(t.text_primary)));
+                ui.label(egui::RichText::new(&row.channel_name).color(c(t.text_primary)));
+                let p = &row.peak;
+                ui.label(egui::RichText::new(num(p.apex_volume_ml as f64, 3)).font(font_code()));
+                ui.label(egui::RichText::new(num(p.area, 2)).font(font_code()));
+                match row.area_pct {
+                    Some(pct) => {
+                        ui.label(egui::RichText::new(num(pct, 1)).font(font_code()));
+                    }
+                    None => dim_dash(ui),
+                }
+                ui.label(egui::RichText::new(num(p.height, 2)).font(font_code()));
+                match p.fwhm_ml {
+                    Some(f) => {
+                        ui.label(egui::RichText::new(num(f as f64, 3)).font(font_code()));
+                    }
+                    None => dim_dash(ui),
+                }
+                match p.estimated_mw_kda {
+                    Some(mw) => {
+                        ui.label(egui::RichText::new(num(mw, 1)).font(font_code()));
+                    }
+                    None => dim_dash(ui),
+                }
+                ui.end_row();
+            }
+
+            if view.peaks.is_empty() {
+                empty_comparison_row(ui, t, &run.meta.run_name, "no peaks integrated yet");
+            }
+            for overlay in overlays.iter().filter(|o| o.peaks.is_empty()) {
+                empty_comparison_row(ui, t, overlay.label(), "no saved analysis for this run");
+            }
+        });
+}
+
+/// A comparison row for a run with nothing to compare, stating why.
+fn empty_comparison_row(ui: &mut Ui, t: Theme, run_label: &str, reason: &str) {
+    ui.label(egui::RichText::new(run_label).color(c(t.text_primary)));
+    ui.label(
+        egui::RichText::new(reason)
+            .font(font_micro())
+            .color(c(t.text_secondary)),
+    );
+    ui.end_row();
+}
+
 /// The Fractions cell for one peak: what to print, and what to explain on hover.
 struct FractionsCell {
     text: String,
