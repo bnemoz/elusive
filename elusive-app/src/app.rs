@@ -1049,7 +1049,7 @@ fn linked_pane(
     egui::CentralPanel::default()
         .frame(adapt::card(t))
         .show(ui, |ui| {
-            outcome = chromatogram::show(ui, run, view, t);
+            outcome = chromatogram::show(ui, run, &[], view, t);
         });
 
     resolve_hover(ui.ctx(), run, view, plate_hover, outcome.hovered_volume);
